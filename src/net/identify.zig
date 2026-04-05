@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const wireproto = @import("../wireproto.zig");
+const version = @import("../version.zig");
 
 pub const default_protocols = [_][]const u8{
     "/multistream/1.0.0",
@@ -29,7 +30,7 @@ pub fn encodeIdentify(
         try wireproto.appendBytesField(&buf, allocator, 3, p);
     }
     try wireproto.appendBytesField(&buf, allocator, 5, "ipfs/0.1.0");
-    try wireproto.appendBytesField(&buf, allocator, 6, "zig-ipfs/0.2.0");
+    try wireproto.appendBytesField(&buf, allocator, 6, version.agent_version);
     return try buf.toOwnedSlice(allocator);
 }
 

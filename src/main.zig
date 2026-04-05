@@ -64,7 +64,7 @@ pub fn main() !void {
 
     const cmd = args.next() orelse {
         try stderr.writeAll(
-            \\zig-ipfs — IPFS-style node (Zig, local + gateway + Kubo wire formats)
+            \\zipfs — IPFS-style node (Zig, local + gateway + Kubo wire formats)
             \\
             \\Data:   add [-r] <path>  cat <cid>  ls <cid> [path]  block put|get
             \\        dag car import|export <path>  config init
@@ -82,7 +82,7 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, cmd, "config")) {
         const sub = args.next() orelse {
-            try stderr.writeAll("usage: zig-ipfs config init\n");
+            try stderr.writeAll("usage: zipfs config init\n");
             return error.BadArgs;
         };
         if (std.mem.eql(u8, sub, "init")) {
@@ -100,7 +100,7 @@ pub fn main() !void {
         const kp = zipfs.net_peer_id.generateKeyPair();
         const pid = try zipfs.net_peer_id.peerIdString(gpa, &kp.public_key);
         defer gpa.free(pid);
-        const line = try std.fmt.allocPrint(gpa, "AgentVersion: zig-ipfs/0.2.0\nPeerID: {s}\n", .{pid});
+        const line = try std.fmt.allocPrint(gpa, "AgentVersion: {s}\nPeerID: {s}\n", .{ zipfs.version.agent_version, pid });
         defer gpa.free(line);
         try std.fs.File.stdout().writeAll(line);
         return;
@@ -343,7 +343,7 @@ pub fn main() !void {
                 _ = try std.Thread.spawn(.{}, daemonReprovideLoop, .{ rr, sec, @as(u64, reprov_secs) * std.time.ns_per_s });
             }
 
-            try stderr.writeAll("zig-ipfs daemon starting...\n");
+            try stderr.print("zipfs {s} daemon starting...\n", .{zipfs.version.semver});
             try printPeerIdP2pLine(gpa, stderr, sec);
             try stderr.print("Gateway (read-only HTTP): http://127.0.0.1:{d}/ipfs/<cid>/...\n", .{cfg.gateway_port});
             try stderr.print("Libp2p swarm (Noise+yamux+identify+bitswap): 0.0.0.0:{d}\n", .{swarm_port});

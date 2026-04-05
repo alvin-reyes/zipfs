@@ -1,6 +1,7 @@
-//! Zig IPFS: content-addressed blocks, CID v0/v1, UnixFS files (local blockstore).
+//! zipfs: content-addressed blocks, CID v0/v1, UnixFS files (local blockstore).
 
 const std = @import("std");
+pub const version = @import("version.zig");
 const wireproto = @import("wireproto.zig");
 
 pub const varint = @import("varint.zig");

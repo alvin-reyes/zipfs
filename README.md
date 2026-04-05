@@ -3,6 +3,7 @@
 <img width="400" height="400" alt="zipfs" src="https://github.com/user-attachments/assets/08870e43-14f6-43d7-b195-35fc80d9bd72" />
 
 An [IPFS](https://ipfs.tech/) content-addressed node written in [Zig](https://ziglang.org/). It implements local UnixFS-style files and directories, a blockstore, CID v0/v1, and enough **Kubo-compatible libp2p wire formats** (Noise, yamux, multistream, bitswap 1.2.0, Kademlia DHT, Identify) to **dial the public network**, **serve inbound peers**, and **fetch or provide** content in a way that interoperates with mainstream IPFS nodes.
+**Current release: v0.1.0** — see [CHANGELOG.md](CHANGELOG.md).
 
 This is **not** a full Kubo replacement: scope is intentionally smaller, but the project aims for correct stacks and keyspaces where it touches the network.
 
@@ -182,6 +183,7 @@ Example dependency in another project (Zig package manager): add this package an
 
 ```
 src/
+  version.zig       # semver + agent string (keep in sync with build.zig.zon)
   main.zig          # CLI entry
   root.zig          # Library exports + tests
   bitswap.zig       # Bitswap protobuf messages
@@ -203,6 +205,11 @@ src/
 
 Issues and PRs welcome. Run **`zig build test`** before submitting changes.
 
+## Releases
+
+- Tag with `git tag -a v0.1.0 -m "zipfs v0.1.0"` and push tags after updating `CHANGELOG.md`, `src/version.zig`, and `build.zig.zon` `version` to match.
+- Build artifacts: `zig build -Doptimize=ReleaseFast` → `zig-out/bin/zipfs`.
+
 ## License
 
-No `LICENSE` file is present in this repository yet; clarify terms with the maintainers before redistributing.
+This project is licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE).
