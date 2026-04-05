@@ -55,7 +55,7 @@ pub fn expandOneBootstrapAddr(allocator: std.mem.Allocator, s: []const u8) ![][]
     const fqdn = try std.fmt.allocPrint(allocator, "_dnsaddr.{s}", .{parsed.domain});
     defer allocator.free(fqdn);
 
-    var ns_owned: ?[]u8 = null;
+    var ns_owned: ?[]const u8 = null;
     defer if (ns_owned) |x| dns_txt.freeNameserverString(allocator, x);
     const ns_ip: []const u8 = if (try dns_txt.firstNameserverFromResolvConf(allocator)) |x| blk: {
         ns_owned = x;

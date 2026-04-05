@@ -448,15 +448,21 @@ pub fn dialDhtFindNode(
     return dialDhtExchange(allocator, host, port, req, ed25519_secret64);
 }
 
-/// Announce provider for `routing_key` (ADD_PROVIDER). Response is decoded and discarded.
+/// Announce provider for `routing_key` (ADD_PROVIDER with peer id + `provider_addrs_bin`). Response is decoded and discarded.
 pub fn dialDhtAddProvider(
     allocator: std.mem.Allocator,
     host: []const u8,
     port: u16,
     routing_key: []const u8,
     ed25519_secret64: [64]u8,
+    provider_addrs_bin: []const []const u8,
 ) !void {
-    const req = try dht.encodeAddProvider(allocator, routing_key);
+    const sk = try std.crypto.sign.Ed25519.SecretKey.fromBytes(ed25519_secret64);
+    const kp = try std.crypto.sign.Ed25519.KeyPair.fromSecretKey(sk);
+    const pub_bytes = kp.public_key.toBytes();
+    const id_mh = try peer_id.peerMultihashBytes(allocator, &pub_bytes);
+    defer allocator.free(id_mh);
+    const req = try dht.encodeAddProvider(allocator, routing_key, id_mh, provider_addrs_bin);
     defer allocator.free(req);
     var resp = try dialDhtExchange(allocator, host, port, req, ed25519_secret64);
     defer resp.deinit(allocator);

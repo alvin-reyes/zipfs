@@ -204,6 +204,7 @@ pub fn walkAndAddProvider(
     secret: [64]u8,
     opts: WalkOpts,
     replicate_k: usize,
+    provider_addrs_bin: []const []const u8,
 ) !void {
     var nodes: std.ArrayList(QueryNode) = .empty;
     defer {
@@ -279,7 +280,7 @@ pub fn walkAndAddProvider(
         const sk = try endpointKey(allocator, cand.host, cand.port);
         defer allocator.free(sk);
         if (seen_send.contains(sk)) continue;
-        libp2p_dial.dialDhtAddProvider(allocator, cand.host, cand.port, routing_key, secret) catch continue;
+        libp2p_dial.dialDhtAddProvider(allocator, cand.host, cand.port, routing_key, secret, provider_addrs_bin) catch continue;
         const sko = try allocator.dupe(u8, sk);
         try seen_send.put(allocator, sko, {});
         sent += 1;

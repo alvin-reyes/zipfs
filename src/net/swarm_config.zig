@@ -4,6 +4,15 @@ const std = @import("std");
 const config = @import("../config.zig");
 const multiaddr = @import("multiaddr.zig");
 
+/// TCP port from first `listen_addrs` entry, or 4001 if unset/unparseable.
+pub fn swarmTcpPortFromConfig(allocator: std.mem.Allocator, cfg: *const config.Config) u16 {
+    if (cfg.listen_addrs.len == 0) return 4001;
+    if (multiaddr.parseStringTcp(allocator, cfg.listen_addrs[0])) |t| {
+        defer t.deinit(allocator);
+        return t.port;
+    } else |_| return 4001;
+}
+
 /// Owned slices (caller holds until process exit for daemon thread).
 pub fn buildIdentifyListenBinaries(allocator: std.mem.Allocator, cfg: *const config.Config, swarm_port: u16) ![][]u8 {
     var list: std.ArrayList([]u8) = .empty;

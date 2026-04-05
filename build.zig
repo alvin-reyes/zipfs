@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
-    const mod = b.addModule("zig_ipfs", .{
+    const mod = b.addModule("zipfs", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
-        .name = "zig_ipfs",
+        .name = "zipfs",
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -66,12 +66,12 @@ pub fn build(b: *std.Build) void {
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
-                // Here "zig_ipfs" is the name you will use in your source code to
-                // import this module (e.g. `@import("zig_ipfs")`). The name is
+                // Here "zipfs" is the name you will use in your source code to
+                // import this module (e.g. `@import("zipfs")`). The name is
                 // repeated because you are allowed to rename your imports, which
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
-                .{ .name = "zig_ipfs", .module = mod },
+                .{ .name = "zipfs", .module = mod },
             },
         }),
     });

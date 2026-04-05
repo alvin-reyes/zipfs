@@ -14,6 +14,7 @@ pub fn provideCid(
     ed25519_secret64: [64]u8,
     opts: dht_walk.WalkOpts,
     replicate_k: usize,
+    provider_addrs_bin: []const []const u8,
 ) !void {
     var c = try cid_mod.Cid.parse(allocator, cid_str);
     defer c.deinit(allocator);
@@ -21,5 +22,5 @@ pub fn provideCid(
     defer allocator.free(routing_key);
     const resolved = try bootstrap_resolve.resolveBootstrapPeers(allocator, bootstrap);
     defer bootstrap_resolve.freeResolved(allocator, resolved);
-    try dht_walk.walkAndAddProvider(allocator, routing_key, resolved, ed25519_secret64, opts, replicate_k);
+    try dht_walk.walkAndAddProvider(allocator, routing_key, resolved, ed25519_secret64, opts, replicate_k, provider_addrs_bin);
 }

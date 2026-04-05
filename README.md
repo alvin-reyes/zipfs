@@ -15,7 +15,7 @@ This is **not** a full Kubo replacement: scope is intentionally smaller, but the
 zig build
 ```
 
-The CLI is installed to `zig-out/bin/zig_ipfs` by default.
+The CLI is installed to `zig-out/bin/zipfs` by default.
 
 ```sh
 zig build -Doptimize=ReleaseFast
@@ -49,7 +49,7 @@ Typical layout:
 
 ```sh
 export IPFS_PATH=/path/to/my-repo   # optional
-zig-out/bin/zig_ipfs config init
+zig-out/bin/zipfs config init
 ```
 
 This writes `config.json` with default **listen** (`/ip4/0.0.0.0/tcp/4001`) and **bootstrap** peers.
@@ -57,20 +57,20 @@ This writes `config.json` with default **listen** (`/ip4/0.0.0.0/tcp/4001`) and 
 ### Add and read a file
 
 ```sh
-zig-out/bin/zig_ipfs add ./README.md
-zig-out/bin/zig_ipfs cat <cid>
+zig-out/bin/zipfs add ./README.md
+zig-out/bin/zipfs cat <cid>
 ```
 
 Recursive directory add:
 
 ```sh
-zig-out/bin/zig_ipfs add -r ./some-dir
+zig-out/bin/zipfs add -r ./some-dir
 ```
 
 ### HTTP gateway (read-only)
 
 ```sh
-zig-out/bin/zig_ipfs gateway
+zig-out/bin/zipfs gateway
 ```
 
 Serves `http://0.0.0.0:<gateway_port>/ipfs/<cid>/...` (default port **8080** from config).
@@ -78,7 +78,7 @@ Serves `http://0.0.0.0:<gateway_port>/ipfs/<cid>/...` (default port **8080** fro
 ### Daemon (gateway + libp2p swarm)
 
 ```sh
-zig-out/bin/zig_ipfs daemon
+zig-out/bin/zipfs daemon
 ```
 
 Runs:
@@ -166,7 +166,7 @@ You are opening **encrypted TCP** to the public IPFS network. Use an isolated re
 
 ## Library
 
-The core logic is exposed as the Zig module **`zig_ipfs`** (`src/root.zig`), importable from this package or by path in another `build.zig`. It includes:
+The core logic is exposed as the Zig module **`zipfs`** (`src/root.zig`), importable from this package or by path in another `build.zig`. It includes:
 
 - CID, multihash, multibase, varint, protobuf wire helpers  
 - UnixFS import/resolution, DAG-PB, blockstore  
@@ -174,7 +174,7 @@ The core logic is exposed as the Zig module **`zig_ipfs`** (`src/root.zig`), imp
 
 The CLI (`src/main.zig`) is a thin wrapper over that module.
 
-Example dependency in another project (Zig package manager): add this package and depend on the `zig_ipfs` module from `build.zig` (see Zig documentation for `addModule` / `lazyDependency`).
+Example dependency in another project (Zig package manager): add this package and depend on the `zipfs` module from `build.zig` (see Zig documentation for `addModule` / `lazyDependency`).
 
 ## Project layout (source)
 

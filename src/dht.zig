@@ -227,9 +227,19 @@ pub fn encodeGetProviders(allocator: std.mem.Allocator, routing_key: []const u8)
     return try m.encode(allocator);
 }
 
-/// Remote uses the Noise peer id as provider; message is only type + key (dht.proto).
-pub fn encodeAddProvider(allocator: std.mem.Allocator, routing_key: []const u8) ![]u8 {
-    const m = Message{ .typ = .add_provider, .key = routing_key };
+/// ADD_PROVIDER with `providerPeers` (field 9): identity multihash + binary multiaddrs, same as Kubo/go-libp2p-kad-dht.
+pub fn encodeAddProvider(
+    allocator: std.mem.Allocator,
+    routing_key: []const u8,
+    provider_peer_id: []const u8,
+    provider_addrs: []const []const u8,
+) ![]u8 {
+    const p = Peer{ .id = provider_peer_id, .addrs = provider_addrs, .connection = .not_connected };
+    const m = Message{
+        .typ = .add_provider,
+        .key = routing_key,
+        .provider_peers = &[_]Peer{p},
+    };
     return try m.encode(allocator);
 }
 

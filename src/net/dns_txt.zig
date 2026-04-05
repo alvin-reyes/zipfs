@@ -9,7 +9,7 @@ pub const DnsTxtError = error{
     InvalidName,
 };
 
-fn encodeDnsName(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, fqdn: []const u8) DnsTxtError!void {
+fn encodeDnsName(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, fqdn: []const u8) (DnsTxtError || std.mem.Allocator.Error)!void {
     var start: usize = 0;
     while (start < fqdn.len) {
         const end = std.mem.indexOfScalarPos(u8, fqdn, start, '.') orelse fqdn.len;
@@ -45,14 +45,14 @@ fn skipName(msg: []const u8, i: *usize) DnsTxtError!void {
 
 fn readU16(msg: []const u8, i: *usize) DnsTxtError!u16 {
     if (i.* + 2 > msg.len) return error.Truncated;
-    const v = std.mem.readInt(u16, msg[i.*][0..2], .big);
+    const v = std.mem.readInt(u16, msg[i.*..][0..2], .big);
     i.* += 2;
     return v;
 }
 
 fn readU32(msg: []const u8, i: *usize) DnsTxtError!u32 {
     if (i.* + 4 > msg.len) return error.Truncated;
-    const v = std.mem.readInt(u32, msg[i.*][0..4], .big);
+    const v = std.mem.readInt(u32, msg[i.*..][0..4], .big);
     i.* += 4;
     return v;
 }
@@ -96,7 +96,7 @@ fn parseTxtRdata(rdata: []const u8, allocator: std.mem.Allocator) ![]u8 {
 }
 
 /// Query `fqdn` for TXT records; each item is one RR’s full text (owned).
-pub fn queryTxtRecords(allocator: std.mem.Allocator, fqdn: []const u8, nameserver_ip: []const u8) (DnsTxtError || std.mem.Allocator.Error || error{InvalidIPAddress})![][]u8 {
+pub fn queryTxtRecords(allocator: std.mem.Allocator, fqdn: []const u8, nameserver_ip: []const u8) ![][]u8 {
     var q = std.ArrayList(u8).empty;
     defer q.deinit(allocator);
 
@@ -108,7 +108,8 @@ pub fn queryTxtRecords(allocator: std.mem.Allocator, fqdn: []const u8, nameserve
     try q.appendSlice(allocator, &[_]u8{ 0x00, 16, 0x00, 1 });
 
     const addr = try std.net.Address.parseIp(nameserver_ip, 53);
-    const sock = try std.posix.socket(addr.any.family, .dgram, .ip);
+    const sock_flags = std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC;
+    const sock = try std.posix.socket(addr.any.family, sock_flags, std.posix.IPPROTO.UDP);
     defer std.posix.close(sock);
 
     const tv = std.posix.timeval{ .sec = 5, .usec = 0 };
