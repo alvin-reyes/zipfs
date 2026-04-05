@@ -39,6 +39,25 @@ pub const Blockstore = struct {
         return self.map.contains(key_utf8);
     }
 
+    pub fn count(self: *const Blockstore) usize {
+        return self.map.count();
+    }
+
+    /// Iterate all blocks (key = CID string, value = raw block bytes).
+    pub fn each(self: *const Blockstore, ctx: *anyopaque, cb: *const fn (*anyopaque, []const u8, []const u8) anyerror!void) !void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            try cb(ctx, e.key_ptr.*, e.value_ptr.*);
+        }
+    }
+
+    pub fn remove(self: *Blockstore, allocator: std.mem.Allocator, key_utf8: []const u8) bool {
+        const kv = self.map.fetchRemove(key_utf8) orelse return false;
+        allocator.free(kv.key);
+        allocator.free(kv.value);
+        return true;
+    }
+
     /// Write every block to `dir` using the CID string as the file name.
     pub fn exportFlatDir(self: *const Blockstore, dir: std.fs.Dir) !void {
         var it = self.map.iterator();

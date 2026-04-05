@@ -24,7 +24,12 @@ fn refListDeinit(allocator: std.mem.Allocator, list: *std.ArrayList(Ref)) void {
 }
 
 pub fn addFile(allocator: std.mem.Allocator, store: *Blockstore, data: []const u8) !Cid {
-    if (data.len <= chunk_size) {
+    return addFileWithChunk(allocator, store, data, chunk_size);
+}
+
+pub fn addFileWithChunk(allocator: std.mem.Allocator, store: *Blockstore, data: []const u8, file_chunk_size: usize) !Cid {
+    if (file_chunk_size < 1024) return error.ChunkTooSmall;
+    if (data.len <= file_chunk_size) {
         return addSingleBlockFile(allocator, store, data);
     }
 
@@ -33,7 +38,7 @@ pub fn addFile(allocator: std.mem.Allocator, store: *Blockstore, data: []const u
 
     var off: usize = 0;
     while (off < data.len) {
-        const end = @min(off + chunk_size, data.len);
+        const end = @min(off + file_chunk_size, data.len);
         const chunk = data[off..end];
         off = end;
         const digest = multihash.digestSha256(chunk);
