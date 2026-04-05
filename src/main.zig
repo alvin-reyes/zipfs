@@ -1,6 +1,27 @@
 const std = @import("std");
 const zig_ipfs = @import("zig_ipfs");
 
+fn daemonReprovideLoop(repo_owned: []const u8, secret: [64]u8, interval_ns: u64) void {
+    const a = std.heap.page_allocator;
+    while (true) {
+        var maybe_cfg = zig_ipfs.config.Config.load(a, repo_owned) catch null;
+        if (maybe_cfg) |*cfg| {
+            defer cfg.deinit(a);
+            const default_bs = zig_ipfs.config.default_bootstrap_peers;
+            const peer_list: []const []const u8 = if (cfg.bootstrap_peers.len > 0) cfg.bootstrap_peers else default_bs[0..];
+            const resolved = zig_ipfs.net_bootstrap_resolve.resolveBootstrapPeers(a, peer_list) catch continue;
+            defer zig_ipfs.net_bootstrap_resolve.freeResolved(a, resolved);
+            var pins = zig_ipfs.pin.PinSet.load(a, repo_owned) catch continue;
+            defer pins.deinit(a);
+            var it = pins.recursive.keyIterator();
+            while (it.next()) |k| {
+                zig_ipfs.net_libp2p_provide.provideCid(a, k.*, resolved, secret, .{}, 8) catch {};
+            }
+        }
+        std.Thread.sleep(interval_ns);
+    }
+}
+
 pub fn main() !void {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa_state.deinit();
@@ -24,14 +45,17 @@ pub fn main() !void {
 
     const cmd = args.next() orelse {
         try stderr.writeAll(
-            \\zig-ipfs — IPFS-style node (Zig, local + gateway + net stubs)
+            \\zig-ipfs — IPFS-style node (Zig, local + gateway + Kubo wire formats)
             \\
             \\Data:   add [-r] <path>  cat <cid>  ls <cid> [path]  block put|get
             \\        dag car import|export <path>  config init
             \\        pin add [-r] <cid>  pin rm [-r] <cid>  pin ls  repo gc
-            \\        gateway
+            \\        gateway | daemon   (HTTP + libp2p swarm on listen_addrs from config)
             \\Net:    net echo-serve <port>  net echo-dial <host> <port>
+            \\        net dial-noise <host> <port>   net dial-bitswap <host> <port> <cid>
+            \\        net fetch <cid>  (iterative DHT + bitswap)  net provide <cid>  (ADD_PROVIDER to closest peers)
             \\        id  (peer id from new Ed25519 key)
+            \\        cat --net <cid>   (fetch over IPFS if missing locally, then cat)
             \\
         );
         return;
@@ -43,9 +67,10 @@ pub fn main() !void {
             return error.BadArgs;
         };
         if (std.mem.eql(u8, sub, "init")) {
-            var c = zig_ipfs.config.Config{};
+            var c = try zig_ipfs.config.Config.initWithMainnetDefaults(gpa);
+            defer c.deinit(gpa);
             try c.save(gpa, repo_root);
-            try stderr.writeAll("wrote config.json\n");
+            try stderr.writeAll("wrote config.json (listen_addrs + bootstrap_peers)\n");
             return;
         }
         try stderr.print("unknown config subcommand: {s}\n", .{sub});
@@ -95,14 +120,29 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, cmd, "cat")) {
-        const cid_str = args.next() orelse {
+        const cid_arg = args.next() orelse {
             try stderr.writeAll("cat: missing cid\n");
             return error.BadArgs;
         };
+        const use_net = std.mem.eql(u8, cid_arg, "--net");
+        const cid_str = if (use_net) args.next() orelse {
+            try stderr.writeAll("cat --net: missing cid\n");
+            return error.BadArgs;
+        } else cid_arg;
         const rpath = args.next() orelse "";
         var node: zig_ipfs.Node = .{};
         defer node.deinit(gpa);
         try zig_ipfs.repo.importStore(&node.store, gpa, repo_root);
+        if (use_net and node.store.get(cid_str) == null) {
+            const sec = try zig_ipfs.net_identity.loadOrCreateSecret64(gpa, repo_root);
+            const default_bs = zig_ipfs.config.default_bootstrap_peers;
+            const peers = if (cfg.bootstrap_peers.len > 0) cfg.bootstrap_peers else default_bs[0..];
+            _ = zig_ipfs.net_libp2p_fetch.fetchBlockIntoStore(gpa, &node.store, cid_str, peers, sec) catch |err| {
+                try stderr.print("cat --net: fetch failed: {}\n", .{err});
+                return err;
+            };
+            try zig_ipfs.repo.exportStore(&node.store, repo_root);
+        }
         const out = if (rpath.len == 0)
             try node.catFile(gpa, cid_str)
         else
@@ -243,18 +283,70 @@ pub fn main() !void {
         return error.BadArgs;
     }
 
-    if (std.mem.eql(u8, cmd, "gateway")) {
+    if (std.mem.eql(u8, cmd, "gateway") or std.mem.eql(u8, cmd, "daemon")) {
         var node: zig_ipfs.Node = .{};
         defer node.deinit(gpa);
         try zig_ipfs.repo.importStore(&node.store, gpa, repo_root);
-        try stderr.print("gateway on 0.0.0.0:{d}\n", .{cfg.gateway_port});
-        try zig_ipfs.gateway.run(gpa, &node.store, cfg.gateway_port);
+
+        if (std.mem.eql(u8, cmd, "daemon")) {
+            const sec = try zig_ipfs.net_identity.loadOrCreateSecret64(gpa, repo_root);
+            const swarm_port: u16 = blk: {
+                if (cfg.listen_addrs.len == 0) break :blk 4001;
+                if (zig_ipfs.net_multiaddr.parseStringTcp(gpa, cfg.listen_addrs[0])) |t| {
+                    defer t.deinit(gpa);
+                    break :blk t.port;
+                } else |_| {}
+                break :blk 4001;
+            };
+            const saddr = try std.net.Address.parseIp("0.0.0.0", swarm_port);
+            const swarm_srv = try saddr.listen(.{ .reuse_address = true });
+            // Server stays open for the accept thread for process lifetime (no defer deinit).
+
+            const listen_bins = try zig_ipfs.net_swarm_config.buildIdentifyListenBinaries(gpa, &cfg, swarm_port);
+            const sk = try std.crypto.sign.Ed25519.SecretKey.fromBytes(sec);
+            const kp = try std.crypto.sign.Ed25519.KeyPair.fromSecretKey(sk);
+            const pub_bytes = kp.public_key.toBytes();
+
+            var sync_mu = std.Thread.Mutex{};
+            var swarm_ctx = zig_ipfs.net_libp2p_serve.SwarmThreadCtx{
+                .server = swarm_srv,
+                .secret = sec,
+                .public_key = pub_bytes,
+                .listen_addrs_bin = listen_bins,
+                .store = &node.store,
+                .mu = &sync_mu,
+            };
+            _ = try std.Thread.spawn(.{}, zig_ipfs.net_libp2p_serve.swarmAcceptLoop, .{&swarm_ctx});
+
+            const reprov_secs = cfg.reprovide_interval_secs orelse 43200;
+            if (reprov_secs > 0) {
+                const rr = try gpa.dupe(u8, repo_root);
+                _ = try std.Thread.spawn(.{}, daemonReprovideLoop, .{ rr, sec, @as(u64, reprov_secs) * std.time.ns_per_s });
+            }
+
+            try stderr.writeAll("zig-ipfs daemon starting...\n");
+            try stderr.print("Gateway (read-only HTTP): http://127.0.0.1:{d}/ipfs/<cid>/...\n", .{cfg.gateway_port});
+            try stderr.print("Libp2p swarm (Noise+yamux+identify+bitswap): 0.0.0.0:{d}\n", .{swarm_port});
+            if (cfg.announce_addrs.len == 0) {
+                try stderr.writeAll("Hint: set \"announce_addrs\" in config.json to your public /ip4/HOST/tcp/PORT for WAN peers (Identify).\n");
+            }
+            if (reprov_secs > 0) {
+                try stderr.print("DHT reprovide for recursive pins every {d}s (set reprovide_interval_secs to 0 to disable).\n", .{reprov_secs});
+            } else {
+                try stderr.writeAll("DHT periodic reprovide disabled (reprovide_interval_secs: 0).\n");
+            }
+            try stderr.writeAll("Ctrl+C to stop.\n\n");
+            try zig_ipfs.gateway.run(gpa, &node.store, cfg.gateway_port, &sync_mu);
+        } else {
+            try stderr.print("gateway on 0.0.0.0:{d}\n", .{cfg.gateway_port});
+            try zig_ipfs.gateway.run(gpa, &node.store, cfg.gateway_port, null);
+        }
         return;
     }
 
     if (std.mem.eql(u8, cmd, "net")) {
         const sub = args.next() orelse {
-            try stderr.writeAll("net: echo-serve <port> | echo-dial <host> <port>\n");
+            try stderr.writeAll("net: echo-serve <port> | echo-dial <host> <port> | dial-noise <host> <port> | dial-bitswap <host> <port> <cid> | fetch <cid> | provide <cid>\n");
             return error.BadArgs;
         };
         if (std.mem.eql(u8, sub, "echo-serve")) {
@@ -278,6 +370,90 @@ pub fn main() !void {
             const port = try std.fmt.parseInt(u16, p, 10);
             try zig_ipfs.net_swarm.dialEcho(host, port);
             try stderr.writeAll("echo ok\n");
+            return;
+        }
+        if (std.mem.eql(u8, sub, "dial-noise")) {
+            const host = args.next() orelse {
+                try stderr.writeAll("net dial-noise: missing host\n");
+                return error.BadArgs;
+            };
+            const p = args.next() orelse {
+                try stderr.writeAll("net dial-noise: missing port\n");
+                return error.BadArgs;
+            };
+            const port = try std.fmt.parseInt(u16, p, 10);
+            const kp = std.crypto.sign.Ed25519.KeyPair.generate();
+            const sec = kp.secret_key.toBytes();
+            var dh = try zig_ipfs.net_libp2p_dial.dialNoiseHandshake(gpa, host, port, sec);
+            defer dh.stream.close();
+            const pid = try zig_ipfs.net_libp2p_dial.remotePeerIdString(gpa, &dh.session.remote_ed25519_pub);
+            defer gpa.free(pid);
+            try stderr.print("remote PeerID: {s}\n", .{pid});
+            return;
+        }
+        if (std.mem.eql(u8, sub, "fetch")) {
+            const cid_str = args.next() orelse {
+                try stderr.writeAll("net fetch: missing cid\n");
+                return error.BadArgs;
+            };
+            var node: zig_ipfs.Node = .{};
+            defer node.deinit(gpa);
+            try zig_ipfs.repo.importStore(&node.store, gpa, repo_root);
+            if (node.store.get(cid_str) != null) {
+                try stderr.writeAll("already in local blockstore\n");
+                return;
+            }
+            const sec = try zig_ipfs.net_identity.loadOrCreateSecret64(gpa, repo_root);
+            const default_bs = zig_ipfs.config.default_bootstrap_peers;
+            const peers = if (cfg.bootstrap_peers.len > 0) cfg.bootstrap_peers else default_bs[0..];
+            const got = try zig_ipfs.net_libp2p_fetch.fetchBlockIntoStore(gpa, &node.store, cid_str, peers, sec);
+            if (got) {
+                try zig_ipfs.repo.exportStore(&node.store, repo_root);
+                try stderr.writeAll("fetched block into repo\n");
+            } else {
+                try stderr.writeAll("block already present\n");
+            }
+            return;
+        }
+        if (std.mem.eql(u8, sub, "provide")) {
+            const cid_str = args.next() orelse {
+                try stderr.writeAll("net provide: missing cid\n");
+                return error.BadArgs;
+            };
+            const sec = try zig_ipfs.net_identity.loadOrCreateSecret64(gpa, repo_root);
+            const default_bs = zig_ipfs.config.default_bootstrap_peers;
+            const peers = if (cfg.bootstrap_peers.len > 0) cfg.bootstrap_peers else default_bs[0..];
+            try zig_ipfs.net_libp2p_provide.provideCid(gpa, cid_str, peers, sec, .{}, 8);
+            try stderr.writeAll("ADD_PROVIDER sent to closest peers (best-effort; see bootstrap_peers)\n");
+            return;
+        }
+        if (std.mem.eql(u8, sub, "dial-bitswap")) {
+            const host = args.next() orelse {
+                try stderr.writeAll("net dial-bitswap: missing host\n");
+                return error.BadArgs;
+            };
+            const p = args.next() orelse {
+                try stderr.writeAll("net dial-bitswap: missing port\n");
+                return error.BadArgs;
+            };
+            const port = try std.fmt.parseInt(u16, p, 10);
+            const cid_str = args.next() orelse {
+                try stderr.writeAll("net dial-bitswap: missing cid\n");
+                return error.BadArgs;
+            };
+            const kp = std.crypto.sign.Ed25519.KeyPair.generate();
+            const sec = kp.secret_key.toBytes();
+            const block = zig_ipfs.net_libp2p_dial.dialBitswapWant(gpa, host, port, cid_str, sec) catch |err| {
+                try stderr.print("dial-bitswap failed: {}\n", .{err});
+                return err;
+            };
+            defer if (block) |b| gpa.free(b);
+            if (block) |b| {
+                try stderr.print("received block: {d} bytes\n", .{b.len});
+                try std.fs.File.stdout().writeAll(b);
+            } else {
+                try stderr.writeAll("peer did not send block (want-haves / dont-have / timeout)\n");
+            }
             return;
         }
         try stderr.print("net: unknown {s}\n", .{sub});

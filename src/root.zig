@@ -1,6 +1,7 @@
 //! Zig IPFS: content-addressed blocks, CID v0/v1, UnixFS files (local blockstore).
 
 const std = @import("std");
+const wireproto = @import("wireproto.zig");
 
 pub const varint = @import("varint.zig");
 pub const multihash = @import("multihash.zig");
@@ -25,6 +26,16 @@ pub const net_swarm = @import("net/swarm_tcp.zig");
 pub const net_noise = @import("net/noise.zig");
 pub const net_yamux = @import("net/yamux.zig");
 pub const net_multistream = @import("net/multistream.zig");
+pub const net_libp2p_dial = @import("net/libp2p_dial.zig");
+pub const net_multiaddr = @import("net/multiaddr.zig");
+pub const net_identity = @import("net/identity.zig");
+pub const net_libp2p_fetch = @import("net/libp2p_fetch.zig");
+pub const net_libp2p_serve = @import("net/libp2p_serve.zig");
+pub const net_dht_walk = @import("net/dht_walk.zig");
+pub const net_libp2p_provide = @import("net/libp2p_provide.zig");
+pub const net_swarm_config = @import("net/swarm_config.zig");
+pub const net_identify = @import("net/identify.zig");
+pub const net_bootstrap_resolve = @import("net/bootstrap_resolve.zig");
 
 pub const Cid = cid.Cid;
 pub const Blockstore = blockstore.Blockstore;
@@ -113,6 +124,95 @@ test "dht xor distance" {
     const b: [32]u8 = .{0} ** 32;
     a[0] = 1;
     try std.testing.expect(dht.distanceXor256(a, b) != 0);
+}
+
+test "dht ping protobuf roundtrip" {
+    const gpa = std.testing.allocator;
+    const enc = try dht.encodePing(gpa);
+    defer gpa.free(enc);
+    var msg = try dht.Message.decode(enc, gpa);
+    defer msg.deinit(gpa);
+    try std.testing.expectEqual(dht.MessageType.ping, msg.typ);
+}
+
+test "ipns verify v2 synthetic" {
+    const gpa = std.testing.allocator;
+    const kp = std.crypto.sign.Ed25519.KeyPair.generate();
+    const data = "fake-dag-cbor-payload";
+    var sign_input: [256]u8 = undefined;
+    const pref = ipns.ipns_signature_prefix;
+    @memcpy(sign_input[0..pref.len], pref);
+    @memcpy(sign_input[pref.len..][0..data.len], data);
+    const sig = try kp.sign(sign_input[0 .. pref.len + data.len], null);
+    const sigb = sig.toBytes();
+    const id_pb = net_peer_id.marshalPublicKeyEd25519(&kp.public_key.toBytes());
+
+    var rec = std.ArrayList(u8).empty;
+    defer rec.deinit(gpa);
+    try wireproto.appendBytesField(&rec, gpa, 7, &id_pb);
+    try wireproto.appendBytesField(&rec, gpa, 8, &sigb);
+    try wireproto.appendBytesField(&rec, gpa, 9, data);
+    const owned = try rec.toOwnedSlice(gpa);
+    defer gpa.free(owned);
+    try ipns.verifyRecord(owned, null);
+}
+
+test "dht xor distance uses sha256 keyspace" {
+    const rk = "/providers/test";
+    var mh: [34]u8 = undefined;
+    mh[0] = 0x12;
+    mh[1] = 0x20;
+    @memset(mh[2..], 0xaa);
+    const d = dht.xorDistanceRoutingToPeer(rk, &mh);
+    try std.testing.expect(d != 0);
+    try std.testing.expectEqual(d, dht.xorDistanceRoutingToPeer(rk, &mh));
+}
+
+test "bitswap wantlist have and block decode" {
+    const gpa = std.testing.allocator;
+    const digest = multihash.digestSha256("x");
+    const c = try Cid.rawSha256(gpa, &digest);
+    defer c.deinit(gpa);
+    const cb = try c.toBytes(gpa);
+    defer gpa.free(cb);
+    const framed = try bitswap.encodeFramedWant(gpa, cb, true);
+    defer gpa.free(framed);
+    var off: usize = 0;
+    const plen = try varint.decodeU64(framed, &off);
+    const inner = framed[off..][0..plen];
+    const items = try bitswap.decodeWantlistItems(inner, gpa);
+    defer {
+        for (items) |*it| it.deinit(gpa);
+        gpa.free(items);
+    }
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqual(bitswap.WantType.have, items[0].want_type);
+    try std.testing.expectEqual(bitswap.WantType.block, items[1].want_type);
+}
+
+test "identify decode agent" {
+    const gpa = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(gpa);
+    try wireproto.appendBytesField(&buf, gpa, 6, "kubo/0.27");
+    const pb = try buf.toOwnedSlice(gpa);
+    defer gpa.free(pb);
+    var info = try net_identify.decodeIdentify(gpa, pb);
+    defer info.deinit(gpa);
+    try std.testing.expectEqualStrings("kubo/0.27", info.agent_version.?);
+}
+
+test "provider key and multiaddr parse" {
+    const gpa = std.testing.allocator;
+    const mh = try gpa.dupe(u8, &[_]u8{ 0x12, 0x20 } ++ [_]u8{0xab} ** 32);
+    defer gpa.free(mh);
+    const pk = try dht.providerKeyForMultihash(gpa, mh);
+    defer gpa.free(pk);
+    try std.testing.expect(std.mem.startsWith(u8, pk, "/providers/"));
+
+    const t = try net_multiaddr.parseStringTcp(gpa, "/ip4/104.131.131.82/tcp/4001/p2p/QmX");
+    defer t.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 4001), t.port);
 }
 
 test "peer id from key" {

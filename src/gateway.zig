@@ -15,7 +15,8 @@ fn sendResp(stream: std.net.Stream, status: []const u8, content_type: []const u8
 }
 
 /// Blocking loop: accept connections and serve `/ipfs/...` until error.
-pub fn run(allocator: std.mem.Allocator, store: *const Blockstore, port: u16) !void {
+/// When `store_sync` is set, it is locked around blockstore reads (pair with libp2p swarm thread).
+pub fn run(allocator: std.mem.Allocator, store: *const Blockstore, port: u16, store_sync: ?*std.Thread.Mutex) !void {
     const addr = try std.net.Address.parseIp("0.0.0.0", port);
     var server = try addr.listen(.{ .reuse_address = true });
     defer server.deinit();
@@ -52,6 +53,9 @@ pub fn run(allocator: std.mem.Allocator, store: *const Blockstore, port: u16) !v
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
         const cid_str = rest[0..slash];
         const subpath = if (slash < rest.len) rest[slash + 1 ..] else "";
+
+        if (store_sync) |m| m.lock();
+        defer if (store_sync) |m| m.unlock();
 
         blk_dir: {
             var dir = resolver.listDirAtPath(allocator, store, cid_str, subpath) catch break :blk_dir;
