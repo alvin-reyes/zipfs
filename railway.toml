@@ -3,7 +3,7 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "zipfs daemon"
+startCommand = "/usr/local/bin/entrypoint.sh"
 healthcheckPath = "/health"
 healthcheckTimeout = 10
 restartPolicyType = "always"
