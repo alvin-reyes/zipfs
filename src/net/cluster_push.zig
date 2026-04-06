@@ -21,6 +21,10 @@ pub const MsgType = enum(u8) {
     have_response = 3,
     ping = 4,
     pong = 5,
+    block_pull = 6,
+    block_pull_resp = 7,
+    manifest_notify = 8,
+    manifest_ack = 9,
 };
 
 /// Block entry within a push message.
@@ -383,6 +387,54 @@ pub fn dialClusterPushPooled(
 
     // Fallback: fresh non-pooled connection
     return dialClusterPush(allocator, host, port, root_cid, blocks, cluster_secret, ed25519_secret64);
+}
+
+/// Encode BLOCK_PULL request: field 1=type, field 2=cid, field 4=cluster_secret.
+pub fn encodeBlockPull(allocator: std.mem.Allocator, cid_bytes: []const u8, cluster_secret: ?[]const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try wireproto.appendVarintField(&buf, allocator, 1, @intFromEnum(MsgType.block_pull));
+    try wireproto.appendBytesField(&buf, allocator, 2, cid_bytes);
+    if (cluster_secret) |s| {
+        try wireproto.appendBytesField(&buf, allocator, 4, s);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Encode BLOCK_PULL_RESP: field 1=type, field 2=cid, field 3=block data (or empty if not found).
+pub fn encodeBlockPullResp(allocator: std.mem.Allocator, cid_bytes: []const u8, data: ?[]const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try wireproto.appendVarintField(&buf, allocator, 1, @intFromEnum(MsgType.block_pull_resp));
+    try wireproto.appendBytesField(&buf, allocator, 2, cid_bytes);
+    if (data) |d| {
+        var entry_buf = std.ArrayList(u8).empty;
+        defer entry_buf.deinit(allocator);
+        try wireproto.appendBytesField(&entry_buf, allocator, 1, cid_bytes);
+        try wireproto.appendBytesField(&entry_buf, allocator, 2, d);
+        try wireproto.appendBytesField(&buf, allocator, 3, entry_buf.items);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Encode MANIFEST_NOTIFY: field 1=type, field 2=root_cid, field 4=cluster_secret.
+pub fn encodeManifestNotify(allocator: std.mem.Allocator, root_cid: []const u8, cluster_secret: ?[]const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try wireproto.appendVarintField(&buf, allocator, 1, @intFromEnum(MsgType.manifest_notify));
+    try wireproto.appendBytesField(&buf, allocator, 2, root_cid);
+    if (cluster_secret) |s| {
+        try wireproto.appendBytesField(&buf, allocator, 4, s);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Encode MANIFEST_ACK: field 1=type.
+pub fn encodeManifestAck(allocator: std.mem.Allocator) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try wireproto.appendVarintField(&buf, allocator, 1, @intFromEnum(MsgType.manifest_ack));
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Push blocks on an existing yamux stream (used by pooled connections).

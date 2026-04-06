@@ -349,6 +349,34 @@ fn advanceStream(
                         framed.appendSlice(allocator, pong) catch return;
                         mux.streamWrite(stream_id, framed.items) catch return;
                     },
+                    .block_pull => {
+                        // Serve a single block to a pulling peer
+                        if (decoded.root_cid) |cid_str| {
+                            mu.lock();
+                            const block_data = store.get(allocator, cid_str);
+                            mu.unlock();
+                            const resp = if (block_data) |data| blk_resp: {
+                                defer allocator.free(data);
+                                break :blk_resp cluster_push.encodeBlockPullResp(allocator, cid_str, data) catch return;
+                            } else cluster_push.encodeBlockPullResp(allocator, cid_str, null) catch return;
+                            defer allocator.free(resp);
+                            var framed: std.ArrayList(u8) = .empty;
+                            defer framed.deinit(allocator);
+                            varint.encodeU64(&framed, allocator, resp.len) catch return;
+                            framed.appendSlice(allocator, resp) catch return;
+                            mux.streamWrite(stream_id, framed.items) catch return;
+                        }
+                    },
+                    .manifest_notify => {
+                        // Acknowledge manifest notification
+                        const ack = cluster_push.encodeManifestAck(allocator) catch return;
+                        defer allocator.free(ack);
+                        var framed: std.ArrayList(u8) = .empty;
+                        defer framed.deinit(allocator);
+                        varint.encodeU64(&framed, allocator, ack.len) catch return;
+                        framed.appendSlice(allocator, ack) catch return;
+                        mux.streamWrite(stream_id, framed.items) catch return;
+                    },
                     else => {},
                 }
                 st.phase = .discard;

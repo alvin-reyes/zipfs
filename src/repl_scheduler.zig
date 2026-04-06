@@ -7,7 +7,8 @@ const replication = @import("replication.zig");
 const blockstore_mod = @import("blockstore.zig");
 const cluster_push = @import("net/cluster_push.zig");
 const conn_pool = @import("net/conn_pool.zig");
-
+const manifest_mod = @import("manifest.zig");
+const pull_engine = @import("pull_engine.zig");
 
 const ReplQueue = repl_queue.ReplQueue;
 const ReplItem = repl_queue.ReplItem;
@@ -39,6 +40,10 @@ pub const SchedulerCtx = struct {
     state_mu: ?*std.Thread.Mutex = null,
     /// Connection pool for reusing Yamux connections to cluster peers.
     pool: ?*conn_pool.ConnPool = null,
+    /// Size threshold in bytes for pull replication (0 = disabled, use push for everything).
+    pull_replication_threshold: u64 = 0,
+    /// Gateway port for HTTP block pull endpoint.
+    gateway_port: u16 = 8080,
 };
 
 /// Inbox poller loop: reads CIDs from the repl_inbox file and enqueues them.
@@ -199,15 +204,17 @@ fn evictStaleConnections(ctx: *SchedulerCtx, last_evict_ns: *i128) void {
 
 /// Process a single replication item: load state, resolve peers, push blocks.
 /// Uses the queue's allocator for item deallocation to match allocation source.
+/// No external blockstore lock needed — Blockstore is internally thread-safe via cache_mu.
+/// state_mu is narrowed to file I/O only (load/save) to prevent blocking during network pushes.
 fn processItem(allocator: std.mem.Allocator, ctx: *SchedulerCtx, item: *ReplItem) void {
     defer item.deinit(ctx.queue.allocator);
 
-    // Lock state_mu to prevent concurrent ClusterState load/save races with self-healing
-    if (ctx.state_mu) |smu| smu.lock();
-    defer if (ctx.state_mu) |smu| smu.unlock();
-
-    // Load cluster state
-    var state = ClusterState.load(allocator, ctx.repo_root) catch return;
+    // Load cluster state under state_mu (protects file access only)
+    var state = blk: {
+        if (ctx.state_mu) |smu| smu.lock();
+        defer if (ctx.state_mu) |smu| smu.unlock();
+        break :blk ClusterState.load(allocator, ctx.repo_root) catch return;
+    };
     defer state.deinit();
 
     // Add configured peers if needed
@@ -217,11 +224,27 @@ fn processItem(allocator: std.mem.Allocator, ctx: *SchedulerCtx, item: *ReplItem
         // Targeted retry: push directly to the specified peer
         pushToPeer(allocator, ctx, &state, item.cid, target, item.mode, item.shard_index, item.retry_count);
     } else {
-        // Hold blockstore mutex during replication to prevent data races with swarm
-        ctx.mu.lock();
-        defer ctx.mu.unlock();
+        // No external blockstore lock — Blockstore is internally thread-safe via cache_mu
 
-        // Auto-select peers and replicate/shard
+        // Check if this DAG is large enough for pull-based replication
+        if (ctx.pull_replication_threshold > 0 and item.mode == .replicate) {
+            const block_estimate = manifest_mod.estimateDagBlocks(allocator, ctx.store, item.cid, 1000);
+            const chunk_size: u64 = 262144; // 256KB default
+            if (block_estimate * chunk_size > ctx.pull_replication_threshold) {
+                // Large DAG: use manifest-based pull replication
+                createAndDistributeManifest(allocator, ctx, &state, item);
+                {
+                    if (ctx.state_mu) |smu| smu.lock();
+                    defer if (ctx.state_mu) |smu| smu.unlock();
+                    state.save(ctx.repo_root) catch |e| {
+                        std.log.err("cluster state save failed: {}", .{e});
+                    };
+                }
+                return;
+            }
+        }
+
+        // Auto-select peers and replicate/shard (existing push path)
         switch (item.mode) {
             .replicate => {
                 const factor = if (item.replication_factor > 0) item.replication_factor else ctx.replication_factor;
@@ -238,9 +261,13 @@ fn processItem(allocator: std.mem.Allocator, ctx: *SchedulerCtx, item: *ReplItem
                 ) catch {
                     // Re-enqueue with higher priority on failure, preserving per-item factor
                     reEnqueueWithRetryAndFactor(ctx, item.cid, item.mode, .retry_high, null, null, item.retry_count, item.replication_factor);
-                    state.save(ctx.repo_root) catch |e| {
-                        std.log.err("cluster state save failed: {}", .{e});
-                    };
+                    {
+                        if (ctx.state_mu) |smu| smu.lock();
+                        defer if (ctx.state_mu) |smu| smu.unlock();
+                        state.save(ctx.repo_root) catch |e| {
+                            std.log.err("cluster state save failed: {}", .{e});
+                        };
+                    }
                     return;
                 };
             },
@@ -255,18 +282,26 @@ fn processItem(allocator: std.mem.Allocator, ctx: *SchedulerCtx, item: *ReplItem
                     ctx.ed25519_secret64,
                 ) catch {
                     reEnqueueWithRetryAndFactor(ctx, item.cid, item.mode, .retry_high, null, null, item.retry_count, item.replication_factor);
-                    state.save(ctx.repo_root) catch |e| {
-                        std.log.err("cluster state save failed: {}", .{e});
-                    };
+                    {
+                        if (ctx.state_mu) |smu| smu.lock();
+                        defer if (ctx.state_mu) |smu| smu.unlock();
+                        state.save(ctx.repo_root) catch |e| {
+                            std.log.err("cluster state save failed: {}", .{e});
+                        };
+                    }
                     return;
                 };
             },
         }
     }
 
-    state.save(ctx.repo_root) catch |e| {
-        std.log.err("cluster state save failed: {}", .{e});
-    };
+    {
+        if (ctx.state_mu) |smu| smu.lock();
+        defer if (ctx.state_mu) |smu| smu.unlock();
+        state.save(ctx.repo_root) catch |e| {
+            std.log.err("cluster state save failed: {}", .{e});
+        };
+    }
 }
 
 /// Push blocks for a CID directly to a specific peer.
@@ -288,21 +323,17 @@ fn pushToPeer(
     }
     defer ctx.peer_concurrency.release(peer_addr);
 
-    // Hold blockstore mutex while reading blocks
-    ctx.mu.lock();
+    // Read blocks (no external lock — Blockstore is internally thread-safe via cache_mu)
     const all_blocks = replication.collectDagBlocks(allocator, ctx.store, cid_str) catch {
-        ctx.mu.unlock();
         reEnqueueWithRetry(ctx, cid_str, mode, .retry_high, peer_addr, shard_index, retry_count);
         return;
     };
     const entries = replication.buildBlockEntries(allocator, ctx.store, all_blocks) catch {
-        ctx.mu.unlock();
         for (all_blocks) |b| allocator.free(b);
         allocator.free(all_blocks);
         reEnqueueWithRetry(ctx, cid_str, mode, .retry_high, peer_addr, shard_index, retry_count);
         return;
     };
-    ctx.mu.unlock();
 
     defer {
         for (all_blocks) |b| allocator.free(b);
@@ -402,4 +433,79 @@ fn addConfiguredPeers(state: *ClusterState, ctx: *SchedulerCtx) void {
     for (ctx.cluster_peers) |addr| {
         state.addPeer("unknown", addr) catch {};
     }
+}
+
+/// Create a manifest for a large DAG and notify target peers to pull.
+fn createAndDistributeManifest(
+    allocator: std.mem.Allocator,
+    ctx: *SchedulerCtx,
+    state: *ClusterState,
+    item: *ReplItem,
+) void {
+    const factor = if (item.replication_factor > 0) item.replication_factor else ctx.replication_factor;
+    const peer_count: u8 = if (factor > 1) factor - 1 else 1;
+
+    // Get alive peers for manifest assignment
+    const alive = state.alivePeers(allocator) catch return;
+    defer allocator.free(alive);
+
+    const selected = replication.selectPeersConsistentHash(
+        allocator,
+        alive,
+        item.cid,
+        peer_count,
+        &.{},
+    ) catch return;
+    defer allocator.free(selected);
+
+    if (selected.len == 0) return;
+
+    // Build peer address list
+    var peer_addrs = allocator.alloc([]const u8, selected.len) catch return;
+    defer allocator.free(peer_addrs);
+    for (selected, 0..) |s, i| {
+        peer_addrs[i] = s.addr;
+    }
+
+    // Create manifest (streaming BFS walk, writes .cids file)
+    var m = manifest_mod.createManifest(
+        allocator,
+        ctx.store,
+        null, // no external lock needed — Blockstore is internally thread-safe
+        ctx.repo_root,
+        item.cid,
+        peer_addrs,
+        factor,
+    ) catch |err| {
+        std.log.err("manifest creation failed for {s}: {}", .{ item.cid, err });
+        return;
+    };
+    defer m.deinit(allocator);
+
+    // Ensure replica record exists
+    _ = state.upsertReplica(item.cid, .replicate, peer_count) catch {};
+
+    // Notify each peer via HTTP to start pulling
+    for (selected) |peer| {
+        const hp = cluster_push.parseHostPort(allocator, peer.addr) catch continue;
+        defer allocator.free(hp.host);
+
+        // Notify peer to pull from our gateway
+        pull_engine.notifyPeerHttp(
+            allocator,
+            hp.host,
+            hp.port,
+            item.cid,
+            hp.host,
+            ctx.gateway_port,
+            ctx.cluster_secret,
+        ) catch {
+            std.log.warn("manifest notify failed for peer {s}", .{peer.addr});
+            continue;
+        };
+    }
+
+    std.log.info("manifest created for {s}: {d} blocks, notified {d} peers", .{
+        item.cid, m.total_blocks, selected.len,
+    });
 }

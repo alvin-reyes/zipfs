@@ -10,6 +10,7 @@ const config_mod = @import("config.zig");
 const cluster_push = @import("net/cluster_push.zig");
 const multiaddr = @import("net/multiaddr.zig");
 const repl_queue_mod = @import("repl_queue.zig");
+const manifest_mod = @import("manifest.zig");
 
 const ClusterState = cluster_mod.ClusterState;
 const ClusterPeer = cluster_mod.ClusterPeer;
@@ -573,12 +574,15 @@ pub fn selfHealingLoop(ctx: *SelfHealCtx) void {
 }
 
 /// Run a single self-healing cycle (public for `cluster sync`).
+/// No external blockstore lock needed — Blockstore is internally thread-safe via cache_mu.
+/// state_mu is narrowed to file I/O only (load/save) to prevent blocking during liveness pings and network pushes.
 pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
-    // Lock state_mu to prevent concurrent ClusterState load/save races with the scheduler
-    if (ctx.state_mu) |smu| smu.lock();
-    defer if (ctx.state_mu) |smu| smu.unlock();
-
-    var state = ClusterState.load(allocator, ctx.repo_root) catch return;
+    // Load cluster state under state_mu (protects file access only)
+    var state = blk: {
+        if (ctx.state_mu) |smu| smu.lock();
+        defer if (ctx.state_mu) |smu| smu.unlock();
+        break :blk ClusterState.load(allocator, ctx.repo_root) catch return;
+    };
     defer state.deinit();
 
     // 1. Liveness check: ping each peer
@@ -694,8 +698,8 @@ pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
                 .shard_index = null,
             });
         } else {
-            // CLI mode: perform repair directly, holding sync_mu for blockstore safety
-            ctx.mu.lock();
+            // CLI mode: perform repair directly
+            // No external lock needed — Blockstore is internally thread-safe via cache_mu
             switch (item.mode) {
                 .replicate => {
                     replicateCid(
@@ -720,17 +724,67 @@ pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
                     ) catch {};
                 },
             }
-            ctx.mu.unlock();
         }
     }
 
-    // 4. Process retry queue (holds sync_mu for blockstore safety)
-    ctx.mu.lock();
+    // 4. Process retry queue (no external lock — Blockstore is internally thread-safe)
     processRetryQueue(allocator, &state, ctx.store, ctx.cluster_secret, ctx.ed25519_secret64);
-    ctx.mu.unlock();
 
-    // 5. Save state atomically
-    state.save(ctx.repo_root) catch |e| {
-        std.log.err("cluster state save failed: {}", .{e});
-    };
+    // 5. Monitor active manifests: check peer progress, mark complete, re-notify stale peers
+    monitorManifests(allocator, ctx);
+
+    // 6. Save state under state_mu (protects file access only)
+    {
+        if (ctx.state_mu) |smu| smu.lock();
+        defer if (ctx.state_mu) |smu| smu.unlock();
+        state.save(ctx.repo_root) catch |e| {
+            std.log.err("cluster state save failed: {}", .{e});
+        };
+    }
 }
+
+/// Monitor active manifests: check peer progress, mark complete, re-notify stale peers.
+fn monitorManifests(allocator: std.mem.Allocator, ctx: *SelfHealCtx) void {
+    var manifests = manifest_mod.Manifest.loadAll(allocator, ctx.repo_root) catch return;
+    defer {
+        for (manifests) |*m| m.deinit(allocator);
+        allocator.free(manifests);
+    }
+
+    const now = std.time.nanoTimestamp();
+    const stale_threshold_ns: i128 = 5 * 60 * std.time.ns_per_s; // 5 minutes
+
+    for (manifests) |*m| {
+        if (m.status != .ready and m.status != .active) continue;
+
+        var all_complete = true;
+        var any_stale = false;
+
+        for (m.target_peers) |*peer| {
+            if (peer.status == .complete) continue;
+            all_complete = false;
+
+            // Check for stale peers (no activity in 5 minutes)
+            if (now - peer.last_activity_ns > stale_threshold_ns) {
+                any_stale = true;
+                peer.status = .pending; // Reset to trigger re-notification
+            }
+        }
+
+        if (all_complete) {
+            m.status = .complete;
+            m.updated_ns = now;
+            m.save(allocator, ctx.repo_root) catch |e| {
+                std.log.err("manifest save failed for {s}: {}", .{ m.root_cid, e });
+            };
+            continue;
+        }
+
+        if (any_stale) {
+            m.status = .active;
+            m.updated_ns = now;
+            m.save(allocator, ctx.repo_root) catch |e| {
+                std.log.warn("manifest save failed for {s}: {}", .{ m.root_cid, e });
+            };
+        }
+    }

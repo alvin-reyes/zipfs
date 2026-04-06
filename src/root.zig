@@ -43,6 +43,8 @@ pub const cluster = @import("cluster.zig");
 pub const replication = @import("replication.zig");
 pub const repl_queue = @import("repl_queue.zig");
 pub const repl_scheduler = @import("repl_scheduler.zig");
+pub const manifest = @import("manifest.zig");
+pub const pull_engine = @import("pull_engine.zig");
 
 pub const Cid = cid.Cid;
 pub const Blockstore = blockstore.Blockstore;

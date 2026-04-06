@@ -5,6 +5,9 @@ const Blockstore = @import("blockstore.zig").Blockstore;
 const resolver = @import("resolver.zig");
 const importer = @import("importer.zig");
 const pin = @import("pin.zig");
+const repl_queue = @import("repl_queue.zig");
+const cluster_mod = @import("cluster.zig");
+const replication = @import("replication.zig");
 
 /// Context for the gateway server, carrying mutable state needed for writes.
 pub const GatewayCtx = struct {
@@ -25,6 +28,18 @@ pub const GatewayCtx = struct {
     replication_factor: u8 = 0,
     /// Max concurrent connections (default 64).
     max_conns: u32 = 64,
+    /// Direct queue injection: bypass file inbox for replication (daemon mode).
+    queue: ?*repl_queue.ReplQueue = null,
+    /// Cluster mode for replication items.
+    cluster_mode: cluster_mod.ClusterMode = .replicate,
+    /// Synchronous replication: block response until peers confirm.
+    sync_repl: bool = false,
+    /// Ed25519 secret for cluster push authentication.
+    ed25519_secret64: ?[64]u8 = null,
+    /// Cluster shared secret for authentication.
+    cluster_secret: ?[]const u8 = null,
+    /// Mutex guarding ClusterState load/save.
+    state_mu: ?*std.Thread.Mutex = null,
 };
 
 fn sendResp(stream: std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) void {
@@ -193,6 +208,57 @@ fn getQueryParam(query: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Synchronous replication: load cluster state, push blocks to peers, return confirmed count.
+/// No external blockstore lock needed — Blockstore is internally thread-safe via cache_mu.
+/// state_mu is narrowed to file I/O only (load/save) to prevent blocking gateway threads during network pushes.
+fn doSyncReplication(allocator: std.mem.Allocator, ctx: *const GatewayCtx, cid_str: []const u8, repl_factor: u8) usize {
+    // Load cluster state under state_mu (protects file access only)
+    var cstate = blk: {
+        if (ctx.state_mu) |smu| smu.lock();
+        defer if (ctx.state_mu) |smu| smu.unlock();
+        break :blk cluster_mod.ClusterState.load(allocator, ctx.repo_root) catch |err| {
+            std.log.err("sync repl: ClusterState.load failed: {}", .{err});
+            return 0;
+        };
+    };
+    defer cstate.deinit();
+
+    for (ctx.cluster_peers) |addr| {
+        cstate.addPeer("unknown", addr) catch {};
+    }
+
+    const factor = if (repl_factor > 0) repl_factor else ctx.replication_factor;
+    const peer_target: u8 = if (factor > 1) factor - 1 else 1;
+
+    // Replicate without holding any lock — blockstore reads and network I/O are lock-free
+    replication.replicateCid(
+        allocator,
+        &cstate,
+        ctx.store,
+        cid_str,
+        peer_target,
+        ctx.cluster_secret,
+        ctx.ed25519_secret64 orelse [_]u8{0} ** 64,
+    ) catch |err| {
+        std.log.err("sync repl: replicateCid failed: {}", .{err});
+    };
+
+    // Save state under state_mu
+    {
+        if (ctx.state_mu) |smu| smu.lock();
+        defer if (ctx.state_mu) |smu| smu.unlock();
+        cstate.save(ctx.repo_root) catch |err| {
+            std.log.err("sync repl: state save failed: {}", .{err});
+        };
+    }
+
+    // Count confirmed peers from replica record
+    if (cstate.replicas.getPtr(cid_str)) |rec| {
+        return rec.confirmed_peers.len;
+    }
+    return 0;
+}
+
 /// Handle POST /api/v0/add — import file, pin, notify replication inbox.
 fn handleAdd(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.net.Stream, headers: []const u8, initial_body: []const u8, target: []const u8) void {
     // Parse Content-Length
@@ -234,20 +300,18 @@ fn handleAdd(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.n
         return;
     };
 
-    // Import file into blockstore and get CID string (under scoped lock)
+    // Import file into blockstore and get CID string
+    // No external lock needed — Blockstore is internally thread-safe via cache_mu
     var cid_buf: [128]u8 = undefined;
     var cid_len: usize = 0;
     {
-        if (ctx.store_sync) |m| m.lock();
-        defer if (ctx.store_sync) |m| m.unlock();
-
         const root_cid = importer.addFileWithChunk(allocator, ctx.store, parsed.data, ctx.chunk_size) catch {
             sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "import failed\n");
             return;
         };
         defer root_cid.deinit(allocator);
 
-        // Copy CID string to stack buffer so it outlives the lock scope
+        // Copy CID string to stack buffer
         const cid_str_tmp = root_cid.toString(allocator) catch {
             sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "cid encoding failed\n");
             return;
@@ -277,7 +341,8 @@ fn handleAdd(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.n
         }
     }
 
-    // Pin + notify replication (outside store lock — file I/O only)
+    // Pin + replication
+    var replicated_count: usize = 0;
     if (do_pin) {
         var pins = pin.PinSet.load(allocator, ctx.repo_root) catch |err| {
             std.log.err("PinSet.load failed: {}", .{err});
@@ -290,7 +355,31 @@ fn handleAdd(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.n
         pins.save(allocator, ctx.repo_root) catch |err| {
             std.log.err("pin save failed: {}", .{err});
         };
-        pin.notifyInboxWithFactor(allocator, ctx.repo_root, cid_str, repl_factor) catch {};
+
+        if (ctx.sync_repl) {
+            // Change C: synchronous replication — block until peers confirm
+            replicated_count = doSyncReplication(allocator, ctx, cid_str, repl_factor);
+        } else if (ctx.queue) |q| {
+            // Change B: direct queue injection — bypass file inbox
+            const duped_cid = q.allocator.dupe(u8, cid_str) catch null;
+            if (duped_cid) |cid_owned| {
+                q.push(.{
+                    .cid = cid_owned,
+                    .mode = ctx.cluster_mode,
+                    .priority = .immediate,
+                    .enqueued_ns = std.time.nanoTimestamp(),
+                    .target_peer = null,
+                    .shard_index = null,
+                    .replication_factor = repl_factor,
+                });
+            } else {
+                // OOM fallback: use file-based inbox
+                pin.notifyInboxWithFactor(allocator, ctx.repo_root, cid_str, repl_factor) catch {};
+            }
+        } else {
+            // Fallback: file-based inbox (gateway-only mode or no cluster)
+            pin.notifyInboxWithFactor(allocator, ctx.repo_root, cid_str, repl_factor) catch {};
+        }
     }
 
     // Kubo-compatible NDJSON response (with JSON-escaped filename)
@@ -300,24 +389,178 @@ fn handleAdd(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.n
     };
     defer allocator.free(escaped_name);
 
-    const json_resp = std.fmt.allocPrint(
-        allocator,
-        "{{\"Name\":\"{s}\",\"Hash\":\"{s}\",\"Size\":\"{d}\"}}\n",
-        .{ escaped_name, cid_str, parsed.data.len },
-    ) catch {
+    const json_resp = if (ctx.sync_repl)
+        std.fmt.allocPrint(
+            allocator,
+            "{{\"Name\":\"{s}\",\"Hash\":\"{s}\",\"Size\":\"{d}\",\"Replicated\":{d}}}\n",
+            .{ escaped_name, cid_str, parsed.data.len, replicated_count },
+        )
+    else
+        std.fmt.allocPrint(
+            allocator,
+            "{{\"Name\":\"{s}\",\"Hash\":\"{s}\",\"Size\":\"{d}\"}}\n",
+            .{ escaped_name, cid_str, parsed.data.len },
+        );
+    const json_body = json_resp catch {
         sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "json format error\n");
         return;
     };
-    defer allocator.free(json_resp);
+    defer allocator.free(json_body);
 
     sendRespWithHeaders(
         stream,
         "HTTP/1.1 200 OK",
         "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n",
-        json_resp,
+        json_body,
     );
 }
 
+/// Constant-time comparison for cluster secret validation.
+fn validateClusterSecret(ctx: *const GatewayCtx, headers: []const u8) bool {
+    const expected = ctx.cluster_secret orelse return true; // No secret = open cluster
+    const provided = getHeader(headers, "x-cluster-secret") orelse return false;
+    if (expected.len != provided.len) return false;
+    // XOR-accumulate for constant-time comparison
+    var acc: u8 = 0;
+    for (expected, provided) |a, b| {
+        acc |= a ^ b;
+    }
+    return acc == 0;
+}
+
+/// Handle GET /api/v0/block/<cid> — return raw block data for pull replication.
+fn handleBlockGet(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.net.Stream, target: []const u8, headers: []const u8) void {
+    if (!validateClusterSecret(ctx, headers)) {
+        sendResp(stream, "HTTP/1.1 403 Forbidden", "text/plain", "invalid cluster secret\n");
+        return;
+    }
+
+    // Extract CID from path: /api/v0/block/<cid>
+    const prefix = "/api/v0/block/";
+    if (!std.mem.startsWith(u8, target, prefix)) {
+        sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "invalid path\n");
+        return;
+    }
+    const cid_str = target[prefix.len..];
+    if (cid_str.len == 0) {
+        sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "missing CID\n");
+        return;
+    }
+
+    // Look up block in store (no external lock — Blockstore is internally thread-safe)
+    const block_data = ctx.store.get(allocator, cid_str);
+
+    if (block_data) |data| {
+        defer allocator.free(data);
+        sendResp(stream, "HTTP/1.1 200 OK", "application/octet-stream", data);
+    } else {
+        sendResp(stream, "HTTP/1.1 404 Not Found", "text/plain", "block not found\n");
+    }
+}
+
+/// Handle POST /api/v0/cluster/manifest/notify — receive manifest pull notification.
+fn handleManifestNotify(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.net.Stream, headers: []const u8, initial_body: []const u8) void {
+    if (!validateClusterSecret(ctx, headers)) {
+        sendResp(stream, "HTTP/1.1 403 Forbidden", "text/plain", "invalid cluster secret\n");
+        return;
+    }
+
+    // Read body
+    const cl_str = getHeader(headers, "content-length") orelse {
+        sendResp(stream, "HTTP/1.1 411 Length Required", "text/plain", "Content-Length required\n");
+        return;
+    };
+    const content_length = std.fmt.parseInt(usize, cl_str, 10) catch {
+        sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "invalid Content-Length\n");
+        return;
+    };
+    if (content_length > 4096) {
+        sendResp(stream, "HTTP/1.1 413 Payload Too Large", "text/plain", "body too large\n");
+        return;
+    }
+
+    const body = readFullBody(allocator, stream, content_length, initial_body) catch {
+        sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "failed to read body\n");
+        return;
+    };
+    defer allocator.free(body);
+
+    // Parse JSON: {"root_cid":"...","origin_host":"...","origin_port":N}
+    const Json = struct {
+        root_cid: ?[]const u8 = null,
+        origin_host: ?[]const u8 = null,
+        origin_port: ?u16 = null,
+    };
+    var parsed = std.json.parseFromSlice(Json, allocator, body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch {
+        sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "invalid JSON\n");
+        return;
+    };
+    defer parsed.deinit();
+
+    const root_cid = parsed.value.root_cid orelse {
+        sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "missing root_cid\n");
+        return;
+    };
+    const origin_host = parsed.value.origin_host orelse {
+        sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "missing origin_host\n");
+        return;
+    };
+    const origin_port = parsed.value.origin_port orelse {
+        sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "missing origin_port\n");
+        return;
+    };
+
+    // Write a manifest notification file for the pull worker to pick up
+    const dir_path = std.fs.path.join(allocator, &.{ ctx.repo_root, "manifests" }) catch {
+        sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "path error\n");
+        return;
+    };
+    defer allocator.free(dir_path);
+    std.fs.cwd().makePath(dir_path) catch {};
+
+    const notify_filename = std.fmt.allocPrint(allocator, "{s}.notify", .{root_cid}) catch {
+        sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "format error\n");
+        return;
+    };
+    defer allocator.free(notify_filename);
+    const notify_path = std.fs.path.join(allocator, &.{ dir_path, notify_filename }) catch {
+        sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "path error\n");
+        return;
+    };
+    defer allocator.free(notify_path);
+
+    const notify_content = std.fmt.allocPrint(allocator, "{s}:{d}", .{ origin_host, origin_port }) catch {
+        sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "format error\n");
+        return;
+    };
+    defer allocator.free(notify_content);
+
+    const file = std.fs.cwd().createFile(notify_path, .{ .truncate = true }) catch {
+        sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "write error\n");
+        return;
+    };
+    file.writeAll(notify_content) catch {
+        file.close();
+        sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "write error\n");
+        return;
+    };
+    file.sync() catch |e| {
+        std.log.warn("manifest notify fsync failed: {}", .{e});
+    };
+    file.close();
+
+    sendRespWithHeaders(
+        stream,
+        "HTTP/1.1 200 OK",
+        "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n",
+        "{\"status\":\"accepted\"}\n",
+    );
+}
+
+/// Handle GET/POST /api/v0/id -- return node identity, addresses, and cluster info as JSON.
 fn handleId(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.net.Stream) void {
     // Build addresses JSON array
     var addrs_buf: std.ArrayList(u8) = .empty;
@@ -411,6 +654,13 @@ fn handleConnection(ctx: *const GatewayCtx, stream: std.net.Stream, active: *std
             handleId(allocator, ctx, stream);
             return;
         }
+        if (std.mem.eql(u8, target_path, "/api/v0/cluster/manifest/notify")) {
+            const hdrs_end_post = std.mem.indexOf(u8, req, "\r\n\r\n") orelse return;
+            const body_start_post = hdrs_end_post + 4;
+            const initial_body_post = if (body_start_post < n) req[body_start_post..n] else "";
+            handleManifestNotify(allocator, ctx, stream, headers, initial_body_post);
+            return;
+        }
         sendResp(stream, "HTTP/1.1 404 Not Found", "text/plain", "not found\n");
         return;
     }
@@ -420,6 +670,11 @@ fn handleConnection(ctx: *const GatewayCtx, stream: std.net.Stream, active: *std
         const get_path = if (std.mem.indexOf(u8, target, "?")) |q| target[0..q] else target;
         if (std.mem.eql(u8, get_path, "/api/v0/id")) {
             handleId(allocator, ctx, stream);
+            return;
+        }
+        // Route: GET /api/v0/block/<cid> — raw block data for pull replication
+        if (std.mem.startsWith(u8, get_path, "/api/v0/block/")) {
+            handleBlockGet(allocator, ctx, stream, get_path, headers);
             return;
         }
     }
@@ -446,11 +701,8 @@ fn handleConnection(ctx: *const GatewayCtx, stream: std.net.Stream, active: *std
     const subpath = if (slash < rest.len) rest[slash + 1 ..] else "";
 
     blk_dir: {
-        var dir = blk: {
-            if (ctx.store_sync) |m| m.lock();
-            defer if (ctx.store_sync) |m| m.unlock();
-            break :blk resolver.listDirAtPath(allocator, ctx.store, cid_str, subpath) catch break :blk_dir;
-        };
+        // No external lock — Blockstore is internally thread-safe via cache_mu
+        var dir = resolver.listDirAtPath(allocator, ctx.store, cid_str, subpath) catch break :blk_dir;
         defer dir.deinit();
         var html = std.ArrayList(u8).empty;
         defer html.deinit(allocator);
@@ -464,23 +716,20 @@ fn handleConnection(ctx: *const GatewayCtx, stream: std.net.Stream, active: *std
         return;
     }
 
-    const body = blk2: {
-        if (ctx.store_sync) |m| m.lock();
-        defer if (ctx.store_sync) |m| m.unlock();
-        break :blk2 resolver.catFileAtPath(allocator, ctx.store, cid_str, subpath) catch |err| switch (err) {
-            error.NotFound => {
-                sendResp(stream, "HTTP/1.1 404 Not Found", "text/plain", "not found\n");
-                return;
-            },
-            error.NotADirectory => {
-                sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "bad request\n");
-                return;
-            },
-            else => {
-                sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "error\n");
-                return;
-            },
-        };
+    // No external lock — Blockstore is internally thread-safe via cache_mu
+    const body = resolver.catFileAtPath(allocator, ctx.store, cid_str, subpath) catch |err| switch (err) {
+        error.NotFound => {
+            sendResp(stream, "HTTP/1.1 404 Not Found", "text/plain", "not found\n");
+            return;
+        },
+        error.NotADirectory => {
+            sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "bad request\n");
+            return;
+        },
+        else => {
+            sendResp(stream, "HTTP/1.1 500 Internal Server Error", "text/plain", "error\n");
+            return;
+        },
     };
     defer allocator.free(body);
     sendResp(stream, "HTTP/1.1 200 OK", "application/octet-stream", body);
@@ -505,8 +754,9 @@ pub fn run(_: std.mem.Allocator, ctx: *const GatewayCtx) !void {
             else => |e| return e,
         };
 
-        // Enforce concurrency limit
+        // Enforce concurrency limit — send 503 instead of silent close
         if (active.load(.acquire) >= ctx.max_conns) {
+            sendResp(conn.stream, "HTTP/1.1 503 Service Unavailable", "text/plain", "server busy\n");
             conn.stream.close();
             continue;
         }

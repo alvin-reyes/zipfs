@@ -46,6 +46,14 @@ pub const Config = struct {
     block_cache_size: ?u32 = null,
     /// Max concurrent gateway connections (default 64).
     max_gateway_conns: ?u32 = null,
+    /// Enable synchronous replication: block upload response until peers confirm (default false).
+    sync_replication: ?bool = null,
+    /// Size threshold in bytes for pull replication (default 64MB). Below = push, above = pull.
+    pull_replication_threshold: ?u64 = null,
+    /// Max concurrent block pulls per manifest (default 4).
+    pull_concurrency: ?u8 = null,
+    /// Batch size for pull checkpoint (default 32).
+    pull_batch_size: ?u16 = null,
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.listen_addrs.len != 0) {
@@ -107,6 +115,10 @@ pub const Config = struct {
             repl_batch_size: ?u16 = null,
             block_cache_size: ?u32 = null,
             max_gateway_conns: ?u32 = null,
+            sync_replication: ?bool = null,
+            pull_replication_threshold: ?u64 = null,
+            pull_concurrency: ?u8 = null,
+            pull_batch_size: ?u16 = null,
         };
         var p = try std.json.parseFromSlice(Json, allocator, data, .{ .allocate = .alloc_always });
         defer p.deinit();
@@ -204,6 +216,16 @@ pub const Config = struct {
         if (p.value.max_gateway_conns) |v| {
             if (v > 0) cfg.max_gateway_conns = v;
         }
+        if (p.value.sync_replication) |v| cfg.sync_replication = v;
+        if (p.value.pull_replication_threshold) |v| {
+            if (v > 0) cfg.pull_replication_threshold = v;
+        }
+        if (p.value.pull_concurrency) |v| {
+            if (v > 0) cfg.pull_concurrency = v;
+        }
+        if (p.value.pull_batch_size) |v| {
+            if (v > 0) cfg.pull_batch_size = v;
+        }
         return cfg;
     }
 
@@ -228,6 +250,10 @@ pub const Config = struct {
             repl_batch_size: ?u16,
             block_cache_size: ?u32,
             max_gateway_conns: ?u32,
+            sync_replication: ?bool,
+            pull_replication_threshold: ?u64,
+            pull_concurrency: ?u8,
+            pull_batch_size: ?u16,
         };
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
@@ -252,6 +278,10 @@ pub const Config = struct {
             .repl_batch_size = self.repl_batch_size,
             .block_cache_size = self.block_cache_size,
             .max_gateway_conns = self.max_gateway_conns,
+            .sync_replication = self.sync_replication,
+            .pull_replication_threshold = self.pull_replication_threshold,
+            .pull_concurrency = self.pull_concurrency,
+            .pull_batch_size = self.pull_batch_size,
         }, .{ .whitespace = .indent_2 })});
         try buf.append(allocator, '\n');
         const path = try std.fs.path.join(allocator, &.{ repo_root, "config.json" });
