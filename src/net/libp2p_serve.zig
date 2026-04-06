@@ -197,9 +197,8 @@ fn advanceStream(
                 }
 
                 for (want_items) |wi| {
-                    mu.lock();
+                    // No external lock — Blockstore is internally thread-safe via cache_mu
                     const data_copy = store.get(allocator, wi.store_key);
-                    mu.unlock();
 
                     switch (wi.want_type) {
                         .have => {
@@ -300,12 +299,10 @@ fn advanceStream(
                                 // Reject non-SHA-256 CIDs — cannot verify integrity
                                 continue;
                             }
-                            mu.lock();
+                            // No external lock — Blockstore is internally thread-safe via cache_mu
                             store.put(allocator, c, entry.data) catch {
-                                mu.unlock();
                                 continue;
                             };
-                            mu.unlock();
                             stored += 1;
                         }
                         const ack = cluster_push.encodePushAck(allocator, stored) catch return;
@@ -325,9 +322,8 @@ fn advanceStream(
                             defer c.deinit(allocator);
                             const key = c.toString(allocator) catch continue;
                             defer allocator.free(key);
-                            mu.lock();
+                            // No external lock — Blockstore is internally thread-safe via cache_mu
                             const has_block = store.has(key);
-                            mu.unlock();
                             if (has_block) {
                                 have_list.append(allocator, cid_bytes) catch continue;
                             }
@@ -352,9 +348,8 @@ fn advanceStream(
                     .block_pull => {
                         // Serve a single block to a pulling peer
                         if (decoded.root_cid) |cid_str| {
-                            mu.lock();
+                            // No external lock — Blockstore is internally thread-safe via cache_mu
                             const block_data = store.get(allocator, cid_str);
-                            mu.unlock();
                             const resp = if (block_data) |data| blk_resp: {
                                 defer allocator.free(data);
                                 break :blk_resp cluster_push.encodeBlockPullResp(allocator, cid_str, data) catch return;

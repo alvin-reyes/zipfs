@@ -504,6 +504,17 @@ fn handleManifestNotify(allocator: std.mem.Allocator, ctx: *const GatewayCtx, st
         sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "missing root_cid\n");
         return;
     };
+    // Validate root_cid: reject path separators to prevent directory traversal
+    for (root_cid) |c| {
+        if (c == '/' or c == '\\' or c == 0) {
+            sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "invalid root_cid\n");
+            return;
+        }
+    }
+    if (std.mem.indexOf(u8, root_cid, "..") != null) {
+        sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "invalid root_cid\n");
+        return;
+    }
     const origin_host = parsed.value.origin_host orelse {
         sendResp(stream, "HTTP/1.1 400 Bad Request", "text/plain", "missing origin_host\n");
         return;

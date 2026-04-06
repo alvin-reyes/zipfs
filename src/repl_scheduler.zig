@@ -44,6 +44,8 @@ pub const SchedulerCtx = struct {
     pull_replication_threshold: u64 = 0,
     /// Gateway port for HTTP block pull endpoint.
     gateway_port: u16 = 8080,
+    /// Local node's routable host for pull replication origin (from announce_addrs).
+    local_gateway_host: []const u8 = "127.0.0.1",
 };
 
 /// Inbox poller loop: reads CIDs from the repl_inbox file and enqueues them.
@@ -490,13 +492,13 @@ fn createAndDistributeManifest(
         const hp = cluster_push.parseHostPort(allocator, peer.addr) catch continue;
         defer allocator.free(hp.host);
 
-        // Notify peer to pull from our gateway
+        // Notify peer to pull from our gateway (use local node's address, not the peer's)
         pull_engine.notifyPeerHttp(
             allocator,
             hp.host,
             hp.port,
             item.cid,
-            hp.host,
+            ctx.local_gateway_host,
             ctx.gateway_port,
             ctx.cluster_secret,
         ) catch {

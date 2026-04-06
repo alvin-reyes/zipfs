@@ -11,6 +11,36 @@ const blockstore_mod = @import("blockstore.zig");
 
 const Blockstore = blockstore_mod.Blockstore;
 
+/// Escape a string for safe embedding in JSON output (handles " and \ characters).
+fn jsonEscapeWrite(w: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    try w.print("\\u{x:0>4}", .{c});
+                } else {
+                    try w.writeByte(c);
+                }
+            },
+        }
+    }
+}
+
+/// Validate a CID string for safe use in filenames (reject path traversal).
+fn isValidCidForPath(cid: []const u8) bool {
+    if (cid.len == 0) return false;
+    for (cid) |c| {
+        if (c == '/' or c == '\\' or c == 0) return false;
+    }
+    if (std.mem.indexOf(u8, cid, "..") != null) return false;
+    return true;
+}
+
 /// Lifecycle status of a replication manifest.
 pub const ManifestStatus = enum {
     walking,
@@ -118,9 +148,9 @@ pub const Manifest = struct {
         defer buf.deinit(allocator);
         const w = buf.writer(allocator);
 
-        try w.writeAll("{");
-        try w.print("\"root_cid\":\"{s}\",", .{self.root_cid});
-        try w.print("\"total_blocks\":{d},", .{self.total_blocks});
+        try w.writeAll("{\"root_cid\":\"");
+        try jsonEscapeWrite(w, self.root_cid);
+        try w.print("\",\"total_blocks\":{d},", .{self.total_blocks});
         try w.print("\"total_bytes\":{d},", .{self.total_bytes});
         try w.print("\"status\":\"{s}\",", .{self.status.toString()});
         try w.print("\"created_ns\":{d},", .{self.created_ns});
@@ -129,9 +159,9 @@ pub const Manifest = struct {
         try w.writeAll("\"target_peers\":[");
         for (self.target_peers, 0..) |p, i| {
             if (i > 0) try w.writeAll(",");
-            try w.writeAll("{");
-            try w.print("\"peer_addr\":\"{s}\",", .{p.peer_addr});
-            try w.print("\"total_blocks\":{d},", .{p.total_blocks});
+            try w.writeAll("{\"peer_addr\":\"");
+            try jsonEscapeWrite(w, p.peer_addr);
+            try w.print("\",\"total_blocks\":{d},", .{p.total_blocks});
             try w.print("\"pulled_blocks\":{d},", .{p.pulled_blocks});
             try w.print("\"last_pulled_idx\":{d},", .{p.last_pulled_idx});
             try w.print("\"last_activity_ns\":{d},", .{p.last_activity_ns});
@@ -168,6 +198,7 @@ pub const Manifest = struct {
 
     /// Load a manifest by root CID.
     pub fn load(allocator: std.mem.Allocator, repo_root: []const u8, root_cid: []const u8) !Manifest {
+        if (!isValidCidForPath(root_cid)) return error.InvalidCid;
         const filename = try std.fmt.allocPrint(allocator, "{s}.json", .{root_cid});
         defer allocator.free(filename);
         const path = try std.fs.path.join(allocator, &.{ repo_root, "manifests", filename });
@@ -408,9 +439,9 @@ pub fn createManifest(
         if (bloom.mightContain(key)) continue;
         bloom.add(key);
 
-        // Write CID to .cids file
-        cids_file.writeAll(key) catch continue;
-        cids_file.writeAll("\n") catch continue;
+        // Write CID to .cids file (propagate errors to avoid silent data loss)
+        try cids_file.writeAll(key);
+        try cids_file.writeAll("\n");
         total_blocks += 1;
 
         // Sync every 1000 blocks to limit data loss on crash
@@ -550,10 +581,7 @@ pub fn readCidBatch(
     var idx: u64 = 0;
     var collected: u16 = 0;
     while (line_it.next()) |line| {
-        if (line.len == 0) {
-            idx += 1;
-            continue;
-        }
+        if (line.len == 0) continue; // Skip empty lines without incrementing idx
         if (idx < start_idx) {
             idx += 1;
             continue;

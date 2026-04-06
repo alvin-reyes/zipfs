@@ -372,6 +372,7 @@ pub fn main() !void {
             var peer_conc: zipfs.repl_queue.PeerConcurrency = undefined;
             var push_pool: zipfs.net_conn_pool.ConnPool = undefined;
             var sched_ctx: zipfs.repl_scheduler.SchedulerCtx = undefined;
+            var pull_ctx: zipfs.pull_engine.PullCtx = undefined;
             var state_mu = std.Thread.Mutex{}; // Guards ClusterState load/save across threads
 
             if (cluster_enabled) {
@@ -420,13 +421,17 @@ pub fn main() !void {
                     .pool = &push_pool,
                     .pull_replication_threshold = cfg.pull_replication_threshold orelse 0,
                     .gateway_port = cfg.gateway_port,
+                    .local_gateway_host = if (cfg.announce_addrs.len > 0) blk: {
+                        const hp = zipfs.net_cluster_push.parseHostPort(gpa, cfg.announce_addrs[0]) catch break :blk "127.0.0.1";
+                        break :blk hp.host; // process-lifetime, intentionally not freed
+                    } else "127.0.0.1",
                 };
                 _ = try std.Thread.spawn(.{}, zipfs.repl_scheduler.inboxPollLoop, .{&sched_ctx});
                 _ = try std.Thread.spawn(.{}, zipfs.repl_scheduler.schedulerLoop, .{&sched_ctx});
 
                 // Pull replication worker thread (watches for manifest notifications)
                 if (cfg.pull_replication_threshold != null) {
-                    const pull_ctx = zipfs.pull_engine.PullCtx{
+                    pull_ctx = .{
                         .store = &node.store,
                         .mu = &sync_mu,
                         .repo_root = try gpa.dupe(u8, repo_root),

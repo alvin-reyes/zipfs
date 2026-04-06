@@ -176,16 +176,16 @@ fn httpFetchBlock(
 
     const hdr = hdr_buf[0..hdr_len];
 
-    // Parse status line
+    // Parse status line: "HTTP/1.1 NNN reason\r\n"
     const status_end = std.mem.indexOf(u8, hdr, "\r\n") orelse return error.BadResponse;
     const status_line = hdr[0..status_end];
 
-    // Check for 404
-    if (std.mem.indexOf(u8, status_line, "404") != null) return error.NotFound;
-    // Check for 403
-    if (std.mem.indexOf(u8, status_line, "403") != null) return error.Forbidden;
-    // Check for 200
-    if (std.mem.indexOf(u8, status_line, "200") == null) return error.BadStatus;
+    // Extract status code at fixed position (RFC 7230: "HTTP/1.1 NNN")
+    if (status_line.len < 12) return error.BadResponse;
+    const status_code = status_line[9..12];
+    if (std.mem.eql(u8, status_code, "404")) return error.NotFound;
+    if (std.mem.eql(u8, status_code, "403")) return error.Forbidden;
+    if (!std.mem.eql(u8, status_code, "200")) return error.BadStatus;
 
     // Parse Content-Length
     const cl_marker = "Content-Length: ";
