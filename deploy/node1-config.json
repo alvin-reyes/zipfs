@@ -1,0 +1,11 @@
+{
+  "gateway_port": 8080,
+  "listen_addrs": ["/ip4/0.0.0.0/tcp/4001"],
+  "announce_addrs": ["/ip4/<NODE1_PUBLIC_IP>/tcp/4001"],
+  "cluster_peers": ["/ip4/<NODE2_PUBLIC_IP>/tcp/4001"],
+  "cluster_secret": "<SHARED_HEX_SECRET>",
+  "cluster_mode": "replicate",
+  "replication_factor": 2,
+  "self_heal_interval_secs": 60,
+  "reprovide_interval_secs": 0
+}

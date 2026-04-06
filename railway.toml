@@ -1,0 +1,10 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "zipfs daemon"
+healthcheckPath = "/health"
+healthcheckTimeout = 10
+restartPolicyType = "always"
+numReplicas = 1

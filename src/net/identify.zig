@@ -12,6 +12,7 @@ pub const default_protocols = [_][]const u8{
     "/ipfs/id/push/1.0.0",
     "/ipfs/bitswap/1.2.0",
     "/ipfs/kad/1.0.0",
+    "/zipfs/cluster/push/1.0.0",
 };
 
 pub fn encodeIdentify(

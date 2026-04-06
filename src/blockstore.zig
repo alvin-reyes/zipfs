@@ -2,11 +2,13 @@
 
 const std = @import("std");
 const cid_mod = @import("cid.zig");
+const repo = @import("repo.zig");
 
 const Cid = cid_mod.Cid;
 
 pub const Blockstore = struct {
     map: std.StringHashMapUnmanaged([]u8) = .empty,
+    repo_root: ?[]const u8 = null,
 
     pub fn deinit(self: *Blockstore, allocator: std.mem.Allocator) void {
         var it = self.map.iterator();
@@ -25,6 +27,9 @@ pub const Blockstore = struct {
             if (!std.mem.eql(u8, old, data)) return error.ConflictingBlock;
             allocator.free(key);
             return;
+        }
+        if (self.repo_root) |root| {
+            try writeBlockFile(root, key, data);
         }
         const owned = try allocator.dupe(u8, data);
         errdefer allocator.free(owned);
@@ -53,6 +58,9 @@ pub const Blockstore = struct {
 
     pub fn remove(self: *Blockstore, allocator: std.mem.Allocator, key_utf8: []const u8) bool {
         const kv = self.map.fetchRemove(key_utf8) orelse return false;
+        if (self.repo_root) |root| {
+            repo.removeBlockFile(root, kv.key) catch {};
+        }
         allocator.free(kv.key);
         allocator.free(kv.value);
         return true;
@@ -77,5 +85,23 @@ pub const Blockstore = struct {
             errdefer allocator.free(key);
             try self.map.put(allocator, key, data);
         }
+    }
+
+    fn writeBlockFile(root: []const u8, cid_key: []const u8, data: []const u8) !void {
+        const path = try repo.joinBlocksPath(std.heap.page_allocator, root, cid_key);
+        defer std.heap.page_allocator.free(path);
+        if (std.fs.path.dirname(path)) |dir| {
+            try std.fs.cwd().makePath(dir);
+        }
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        file.writeAll(data) catch |e| {
+            file.close();
+            return e;
+        };
+        file.sync() catch |e| {
+            file.close();
+            return e;
+        };
+        file.close();
     }
 };

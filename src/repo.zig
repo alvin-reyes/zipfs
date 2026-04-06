@@ -15,7 +15,7 @@ pub fn shardParts(cid_key: []const u8) [4]u8 {
     };
 }
 
-fn joinBlocksPath(allocator: std.mem.Allocator, repo_root: []const u8, cid_key: []const u8) ![]u8 {
+pub fn joinBlocksPath(allocator: std.mem.Allocator, repo_root: []const u8, cid_key: []const u8) ![]u8 {
     const sp = shardParts(cid_key);
     const a = sp[0..2];
     const b = sp[2..4];
