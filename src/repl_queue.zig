@@ -77,7 +77,7 @@ pub const ReplQueue = struct {
                 const last = &self.items.items[self.items.items.len - 1];
                 // Use full ordering: new item must sort before the last (worst) item
                 if (ReplItem.orderLessThan({}, item, last.*)) {
-                    var removed = self.items.pop();
+                    var removed = self.items.pop() orelse unreachable;
                     removed.deinit(self.allocator);
                     self.dropped_count += 1;
                 } else {
@@ -113,11 +113,11 @@ pub const ReplQueue = struct {
             self.dropped_count += 1;
             return;
         };
-        // Shift elements [insert_pos..len] right by one to make room
-        if (insert_pos < len) {
+        // Shift elements [insert_pos..item_count] right by one to make room
+        if (insert_pos < item_count) {
             const items = self.items.items;
-            const new_item = items[len]; // the just-appended item
-            std.mem.copyBackwards(ReplItem, items[insert_pos + 1 .. len + 1], items[insert_pos..len]);
+            const new_item = items[item_count]; // the just-appended item
+            std.mem.copyBackwards(ReplItem, items[insert_pos + 1 .. item_count + 1], items[insert_pos..item_count]);
             items[insert_pos] = new_item;
         }
 
