@@ -87,7 +87,9 @@ pub const YamuxOverNoise = struct {
         try self.ensureLen(12);
         var hbuf: [12]u8 = undefined;
         @memcpy(&hbuf, self.rx.items[0..12]);
-        const h = yamux.Header.decode(&hbuf);
+        const h = yamux.Header.decode(&hbuf) orelse return error.InvalidFrame;
+        const max_frame_size: u32 = 4 * 1024 * 1024; // 4MB — matches protocol-level limits
+        if (h.length > max_frame_size) return error.MessageTooLong;
         const total = 12 + @as(usize, h.length);
         try self.ensureLen(total);
         const body = try allocator.dupe(u8, self.rx.items[12..total]);
@@ -354,6 +356,7 @@ pub fn dialBitswapWant(
     ed25519_secret64: [64]u8,
 ) !?[]u8 {
     var conn = try dialNoiseYamuxClient(allocator, host, port, ed25519_secret64);
+    conn.mux.sess = &conn.ns; // Fix: point to the returned copy, not the dead stack local
     defer conn.mux.deinit();
     defer conn.stream.close();
 
@@ -401,6 +404,7 @@ pub fn dialDhtExchange(
     ed25519_secret64: [64]u8,
 ) !dht.Message {
     var conn = try dialNoiseYamuxClient(allocator, host, port, ed25519_secret64);
+    conn.mux.sess = &conn.ns; // Fix: point to the returned copy, not the dead stack local
     defer conn.mux.deinit();
     defer conn.stream.close();
 

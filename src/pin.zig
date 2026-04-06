@@ -75,10 +75,26 @@ pub const PinSet = struct {
             .recursive = r.items,
         }, .{ .whitespace = .indent_2 })});
         try buf.append(allocator, '\n');
-        const path = try std.fs.path.join(allocator, &.{ repo_root, "pins.json" });
-        defer allocator.free(path);
         try std.fs.cwd().makePath(repo_root);
-        try std.fs.cwd().writeFile(.{ .sub_path = path, .data = buf.items });
+
+        // Atomic write: temp file + fsync + rename
+        const tmp_path = try std.fs.path.join(allocator, &.{ repo_root, "pins.json.tmp" });
+        defer allocator.free(tmp_path);
+        const final_path = try std.fs.path.join(allocator, &.{ repo_root, "pins.json" });
+        defer allocator.free(final_path);
+
+        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+        tmp_file.writeAll(buf.items) catch |e| {
+            tmp_file.close();
+            return e;
+        };
+        tmp_file.sync() catch |e| {
+            tmp_file.close();
+            return e;
+        };
+        tmp_file.close();
+        try std.fs.cwd().rename(tmp_path, final_path);
     }
 
     pub fn pinDirect(self: *PinSet, allocator: std.mem.Allocator, cid_str: []const u8) !void {
@@ -103,6 +119,36 @@ pub const PinSet = struct {
         if (self.recursive.fetchRemove(cid_str)) |kv| allocator.free(kv.key);
     }
 };
+
+/// Append a CID to the replication inbox file for the scheduler to pick up.
+/// Fire-and-forget: failure just means self-healing will catch it later.
+pub fn notifyInbox(allocator: std.mem.Allocator, repo_root: []const u8, cid_str: []const u8) !void {
+    return notifyInboxWithFactor(allocator, repo_root, cid_str, 0);
+}
+
+/// Notify the replication inbox with an optional per-CID replication factor.
+/// factor=0 means "use the cluster default".
+pub fn notifyInboxWithFactor(allocator: std.mem.Allocator, repo_root: []const u8, cid_str: []const u8, factor: u8) !void {
+    const path = try std.fs.path.join(allocator, &.{ repo_root, "repl_inbox" });
+    defer allocator.free(path);
+    std.fs.cwd().makePath(repo_root) catch {};
+    // Open existing file for append, or create new
+    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |err| switch (err) {
+        error.FileNotFound => try std.fs.cwd().createFile(path, .{ .truncate = false }),
+        else => return err,
+    };
+    defer file.close();
+    try file.seekFromEnd(0);
+    var wbuf: [256]u8 = undefined;
+    var w = file.writer(&wbuf);
+    if (factor > 0) {
+        try w.interface.print("{s}:{d}\n", .{ cid_str, factor });
+    } else {
+        try w.interface.print("{s}\n", .{cid_str});
+    }
+    try w.interface.flush();
+    try file.sync();
+}
 
 fn markRecursive(allocator: std.mem.Allocator, store: *const Blockstore, key: []const u8, marked: *std.StringHashMapUnmanaged(void)) !void {
     if (marked.contains(key)) return;

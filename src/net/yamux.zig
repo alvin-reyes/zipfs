@@ -29,10 +29,10 @@ pub const Header = struct {
         std.mem.writeInt(u32, out[8..12], self.length, .big);
     }
 
-    pub fn decode(buf: *const [12]u8) Header {
+    pub fn decode(buf: *const [12]u8) ?Header {
         return .{
             .version = buf[0],
-            .typ = @enumFromInt(buf[1]),
+            .typ = std.meta.intToEnum(FrameType, buf[1]) catch return null,
             .flags = std.mem.readInt(u16, buf[2..4], .big),
             .stream_id = std.mem.readInt(u32, buf[4..8], .big),
             .length = std.mem.readInt(u32, buf[8..12], .big),
@@ -43,7 +43,7 @@ pub const Header = struct {
 /// Read a full frame: 12-byte header + `length` bytes body into caller buffer (must be sized >= length).
 pub fn readFrame(stream: std.net.Stream, header_buf: *[12]u8, body: []u8) !Header {
     try readFull(stream, header_buf);
-    const h = Header.decode(header_buf);
+    const h = Header.decode(header_buf) orelse return error.InvalidFrame;
     if (h.length > body.len) return error.BufferTooSmall;
     if (h.length > 0) try readFull(stream, body[0..h.length]);
     return h;

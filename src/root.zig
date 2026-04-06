@@ -37,6 +37,11 @@ pub const net_libp2p_provide = @import("net/libp2p_provide.zig");
 pub const net_swarm_config = @import("net/swarm_config.zig");
 pub const net_identify = @import("net/identify.zig");
 pub const net_bootstrap_resolve = @import("net/bootstrap_resolve.zig");
+pub const net_cluster_push = @import("net/cluster_push.zig");
+pub const cluster = @import("cluster.zig");
+pub const replication = @import("replication.zig");
+pub const repl_queue = @import("repl_queue.zig");
+pub const repl_scheduler = @import("repl_scheduler.zig");
 
 pub const Cid = cid.Cid;
 pub const Blockstore = blockstore.Blockstore;
