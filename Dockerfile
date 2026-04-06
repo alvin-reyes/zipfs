@@ -1,4 +1,4 @@
-FROM ghcr.io/ziglang/zig:0.15.1 AS builder
+FROM kassany/bookworm-ziglang:0.15.1 AS builder
 WORKDIR /app
 COPY . .
 RUN zig build -Doptimize=ReleaseFast
