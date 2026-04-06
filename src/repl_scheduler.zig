@@ -235,13 +235,7 @@ fn processItem(allocator: std.mem.Allocator, ctx: *SchedulerCtx, item: *ReplItem
             if (block_estimate * chunk_size > ctx.pull_replication_threshold) {
                 // Large DAG: use manifest-based pull replication
                 createAndDistributeManifest(allocator, ctx, &state, item);
-                {
-                    if (ctx.state_mu) |smu| smu.lock();
-                    defer if (ctx.state_mu) |smu| smu.unlock();
-                    state.save(ctx.repo_root) catch |e| {
-                        std.log.err("cluster state save failed: {}", .{e});
-                    };
-                }
+                state.mergeSave(ctx.repo_root, ctx.state_mu);
                 return;
             }
         }
@@ -263,13 +257,7 @@ fn processItem(allocator: std.mem.Allocator, ctx: *SchedulerCtx, item: *ReplItem
                 ) catch {
                     // Re-enqueue with higher priority on failure, preserving per-item factor
                     reEnqueueWithRetryAndFactor(ctx, item.cid, item.mode, .retry_high, null, null, item.retry_count, item.replication_factor);
-                    {
-                        if (ctx.state_mu) |smu| smu.lock();
-                        defer if (ctx.state_mu) |smu| smu.unlock();
-                        state.save(ctx.repo_root) catch |e| {
-                            std.log.err("cluster state save failed: {}", .{e});
-                        };
-                    }
+                    state.mergeSave(ctx.repo_root, ctx.state_mu);
                     return;
                 };
             },
@@ -284,26 +272,14 @@ fn processItem(allocator: std.mem.Allocator, ctx: *SchedulerCtx, item: *ReplItem
                     ctx.ed25519_secret64,
                 ) catch {
                     reEnqueueWithRetryAndFactor(ctx, item.cid, item.mode, .retry_high, null, null, item.retry_count, item.replication_factor);
-                    {
-                        if (ctx.state_mu) |smu| smu.lock();
-                        defer if (ctx.state_mu) |smu| smu.unlock();
-                        state.save(ctx.repo_root) catch |e| {
-                            std.log.err("cluster state save failed: {}", .{e});
-                        };
-                    }
+                    state.mergeSave(ctx.repo_root, ctx.state_mu);
                     return;
                 };
             },
         }
     }
 
-    {
-        if (ctx.state_mu) |smu| smu.lock();
-        defer if (ctx.state_mu) |smu| smu.unlock();
-        state.save(ctx.repo_root) catch |e| {
-            std.log.err("cluster state save failed: {}", .{e});
-        };
-    }
+    state.mergeSave(ctx.repo_root, ctx.state_mu);
 }
 
 /// Push blocks for a CID directly to a specific peer.

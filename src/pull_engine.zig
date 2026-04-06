@@ -64,12 +64,8 @@ pub fn pullManifest(
         if (cids.len == 0) break; // EOF — all CIDs processed
 
         for (cids) |cid_str| {
-            // Skip blocks we already have
-            const already_has = blk: {
-                ctx.mu.lock();
-                defer ctx.mu.unlock();
-                break :blk ctx.store.has(cid_str);
-            };
+            // Skip blocks we already have (no lock — Blockstore is internally thread-safe)
+            const already_has = ctx.store.has(cid_str);
             if (already_has) {
                 checkpoint_idx += 1;
                 continue;
@@ -106,10 +102,8 @@ pub fn pullManifest(
             };
             defer allocator.free(block_data);
 
-            // Store the block
+            // Store the block (no lock — Blockstore is internally thread-safe)
             {
-                ctx.mu.lock();
-                defer ctx.mu.unlock();
                 var c = cid_mod.Cid.parse(allocator, cid_str) catch {
                     checkpoint_idx += 1;
                     continue;
@@ -232,25 +226,102 @@ pub fn pullWorkerLoop(ctx: *const PullCtx) void {
     }
 }
 
-/// Run one pull cycle: load all manifests and pull blocks for any with status ready or active.
+/// Run one pull cycle: scan for .notify files, pull blocks from origin.
 fn pullOnce(allocator: std.mem.Allocator, ctx: *const PullCtx) void {
-    const manifests = Manifest.loadAll(allocator, ctx.repo_root) catch return;
+    const dir_path = std.fs.path.join(allocator, &.{ ctx.repo_root, "manifests" }) catch return;
+    defer allocator.free(dir_path);
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    // Collect .notify filenames first (can't modify dir while iterating)
+    var notify_files = std.ArrayList([]u8).empty;
     defer {
-        for (manifests) |*m| {
-            var mm = m.*;
-            mm.deinit(allocator);
-        }
-        allocator.free(manifests);
+        for (notify_files.items) |f| allocator.free(f);
+        notify_files.deinit(allocator);
     }
 
-    for (manifests) |m| {
-        if (m.status != .ready and m.status != .active) continue;
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".notify")) continue;
+        notify_files.append(allocator, allocator.dupe(u8, entry.name) catch continue) catch continue;
+    }
 
-        for (m.target_peers) |peer| {
-            if (peer.status == .complete) continue;
-            // TODO: resolve origin host:port once manifest_notify is implemented.
-            _ = peer;
+    for (notify_files.items) |filename| {
+        // Extract root_cid from filename: "<root_cid>.notify"
+        const root_cid = filename[0 .. filename.len - ".notify".len];
+        if (root_cid.len == 0) continue;
+
+        const notify_path = std.fs.path.join(allocator, &.{ dir_path, filename }) catch continue;
+        defer allocator.free(notify_path);
+
+        // Read notify content: "origin_host:origin_port"
+        const content = std.fs.cwd().readFileAlloc(allocator, notify_path, 4096) catch continue;
+        defer allocator.free(content);
+
+        // Trim whitespace
+        var trimmed = content;
+        while (trimmed.len > 0 and (trimmed[trimmed.len - 1] == '\n' or trimmed[trimmed.len - 1] == '\r' or trimmed[trimmed.len - 1] == ' '))
+            trimmed = trimmed[0 .. trimmed.len - 1];
+
+        if (trimmed.len == 0) {
+            std.fs.cwd().deleteFile(notify_path) catch {};
+            continue;
         }
+
+        // Parse "host:port"
+        const colon = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse {
+            std.log.warn("pull: invalid notify content for {s}", .{root_cid});
+            continue;
+        };
+        const origin_host = trimmed[0..colon];
+        const origin_port = std.fmt.parseInt(u16, trimmed[colon + 1 ..], 10) catch {
+            std.log.warn("pull: invalid port in notify for {s}", .{root_cid});
+            continue;
+        };
+
+        // Load checkpoint progress if resuming
+        const progress = manifest_mod.loadProgress(allocator, ctx.repo_root, root_cid, origin_host);
+
+        // Load manifest to get total_blocks (may not exist yet if origin hasn't sent it)
+        var total_blocks: u64 = 0;
+        if (Manifest.load(allocator, ctx.repo_root, root_cid)) |m| {
+            total_blocks = m.total_blocks;
+            var mm = m;
+            mm.deinit(allocator);
+        } else |_| {}
+
+        const job = PullJob{
+            .root_cid = root_cid,
+            .origin_host = origin_host,
+            .origin_port = origin_port,
+            .checkpoint_idx = progress.last_idx,
+            .total_blocks = total_blocks,
+        };
+
+        std.log.info("pull: starting pull for {s} from {s}:{d} (checkpoint={d})", .{
+            root_cid, origin_host, origin_port, progress.last_idx,
+        });
+
+        const pulled = pullManifest(allocator, ctx, &job) catch |err| {
+            std.log.err("pull: pullManifest failed for {s}: {}", .{ root_cid, err });
+            continue; // Keep .notify file for retry on next cycle
+        };
+
+        std.log.info("pull: completed {s}: pulled {d} blocks", .{ root_cid, pulled });
+
+        // Update manifest status to complete
+        if (Manifest.load(allocator, ctx.repo_root, root_cid)) |loaded| {
+            var m = loaded;
+            defer m.deinit(allocator);
+            m.status = .complete;
+            m.updated_ns = std.time.nanoTimestamp();
+            m.save(allocator, ctx.repo_root) catch {};
+        } else |_| {}
+
+        // Remove .notify file on success
+        std.fs.cwd().deleteFile(notify_path) catch {};
     }
 }
 

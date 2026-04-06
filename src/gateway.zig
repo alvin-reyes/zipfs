@@ -243,14 +243,8 @@ fn doSyncReplication(allocator: std.mem.Allocator, ctx: *const GatewayCtx, cid_s
         std.log.err("sync repl: replicateCid failed: {}", .{err});
     };
 
-    // Save state under state_mu
-    {
-        if (ctx.state_mu) |smu| smu.lock();
-        defer if (ctx.state_mu) |smu| smu.unlock();
-        cstate.save(ctx.repo_root) catch |err| {
-            std.log.err("sync repl: state save failed: {}", .{err});
-        };
-    }
+    // Merge-on-save: reload fresh state, merge confirmed peers, save (TOCTOU fix)
+    cstate.mergeSave(ctx.repo_root, ctx.state_mu);
 
     // Count confirmed peers from replica record
     if (cstate.replicas.getPtr(cid_str)) |rec| {

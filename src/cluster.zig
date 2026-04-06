@@ -536,6 +536,81 @@ pub const ClusterState = struct {
         rec.confirmed_peers = new;
     }
 
+    /// Merge confirmed peers and peer liveness from a working copy into this (fresh) state.
+    /// Used for merge-on-save: load fresh state under lock, merge working changes, save.
+    /// This prevents lost updates when state_mu is released between load and save.
+    pub fn mergeFrom(self: *ClusterState, working: *const ClusterState) !void {
+        // Merge replica confirmed_peers: add any from working that aren't in fresh
+        var rit = working.replicas.iterator();
+        while (rit.next()) |entry| {
+            const cid = entry.key_ptr.*;
+            const w_rec = entry.value_ptr.*;
+            if (self.replicas.contains(cid)) {
+                // Merge confirmed peers into existing record
+                for (w_rec.confirmed_peers) |wp| {
+                    var found = false;
+                    if (self.replicas.getPtr(cid)) |f_rec| {
+                        for (f_rec.confirmed_peers) |fp| {
+                            if (std.mem.eql(u8, fp, wp)) {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!found) {
+                        try self.addConfirmedPeer(cid, wp);
+                    }
+                }
+            } else {
+                // New replica from working copy — add it
+                _ = try self.upsertReplica(cid, w_rec.mode, w_rec.target_n);
+                for (w_rec.confirmed_peers) |wp| {
+                    try self.addConfirmedPeer(cid, wp);
+                }
+            }
+        }
+
+        // Merge peer liveness: use working copy values if more recent
+        for (working.peers.items) |wp| {
+            if (self.findPeerByAddr(wp.addr)) |fp| {
+                if (wp.last_seen_ns > fp.last_seen_ns) {
+                    fp.last_seen_ns = wp.last_seen_ns;
+                    fp.is_alive = wp.is_alive;
+                    fp.consecutive_failures = wp.consecutive_failures;
+                }
+            }
+        }
+    }
+
+    /// Save with merge: reload fresh state from disk, merge working changes, save.
+    /// Prevents lost updates from concurrent modifications when state_mu was
+    /// released between load and save (TOCTOU fix).
+    pub fn mergeSave(self: *const ClusterState, repo_root: []const u8, state_mu: ?*std.Thread.Mutex) void {
+        if (state_mu) |smu| smu.lock();
+        defer if (state_mu) |smu| smu.unlock();
+
+        var fresh = ClusterState.load(self.allocator, repo_root) catch {
+            // Can't reload — fall back to direct save (better than losing all changes)
+            self.save(repo_root) catch |e| {
+                std.log.err("cluster state save failed: {}", .{e});
+            };
+            return;
+        };
+        defer fresh.deinit();
+
+        fresh.mergeFrom(self) catch {
+            // Merge failed — fall back to direct save
+            self.save(repo_root) catch |e| {
+                std.log.err("cluster state save failed: {}", .{e});
+            };
+            return;
+        };
+
+        fresh.save(repo_root) catch |e| {
+            std.log.err("cluster state save failed: {}", .{e});
+        };
+    }
+
     /// Remove a replica record by CID.
     pub fn removeReplica(self: *ClusterState, cid_str: []const u8) void {
         if (self.replicas.fetchRemove(cid_str)) |kv| {

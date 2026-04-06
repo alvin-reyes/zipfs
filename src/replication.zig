@@ -733,14 +733,8 @@ pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
     // 5. Monitor active manifests: check peer progress, mark complete, re-notify stale peers
     monitorManifests(allocator, ctx);
 
-    // 6. Save state under state_mu (protects file access only)
-    {
-        if (ctx.state_mu) |smu| smu.lock();
-        defer if (ctx.state_mu) |smu| smu.unlock();
-        state.save(ctx.repo_root) catch |e| {
-            std.log.err("cluster state save failed: {}", .{e});
-        };
-    }
+    // 6. Merge-on-save: reload fresh state, merge changes, save (TOCTOU fix)
+    state.mergeSave(ctx.repo_root, ctx.state_mu);
 }
 
 /// Monitor active manifests: check peer progress, mark complete, re-notify stale peers.

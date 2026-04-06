@@ -370,9 +370,66 @@ const BloomFilter = struct {
     }
 };
 
+/// Deduplication set: uses precise HashMap for smaller DAGs (0% FPR) and
+/// falls back to BloomFilter for very large DAGs (>1M items) to save memory.
+const DedupSet = struct {
+    use_bloom: bool,
+    bloom: BloomFilter,
+    map: std.StringHashMapUnmanaged(void),
+
+    fn init(allocator: std.mem.Allocator, known_items: u64) !DedupSet {
+        const bloom_threshold: u64 = 1_000_000;
+        if (known_items >= bloom_threshold) {
+            return .{
+                .use_bloom = true,
+                .bloom = try BloomFilter.init(allocator, known_items),
+                .map = .empty,
+            };
+        } else {
+            return .{
+                .use_bloom = false,
+                .bloom = undefined,
+                .map = .empty,
+            };
+        }
+    }
+
+    fn deinit(self: *DedupSet, allocator: std.mem.Allocator) void {
+        if (self.use_bloom) {
+            self.bloom.deinit(allocator);
+        } else {
+            var kit = self.map.keyIterator();
+            while (kit.next()) |k| allocator.free(k.*);
+            self.map.deinit(allocator);
+        }
+    }
+
+    fn add(self: *DedupSet, allocator: std.mem.Allocator, key: []const u8) !void {
+        if (self.use_bloom) {
+            self.bloom.add(key);
+        } else {
+            if (!self.map.contains(key)) {
+                const owned = try allocator.dupe(u8, key);
+                self.map.put(allocator, owned, {}) catch |e| {
+                    allocator.free(owned);
+                    return e;
+                };
+            }
+        }
+    }
+
+    fn contains(self: *const DedupSet, key: []const u8) bool {
+        if (self.use_bloom) {
+            return self.bloom.mightContain(key);
+        } else {
+            return self.map.contains(key);
+        }
+    }
+};
+
 /// Create a manifest by streaming BFS walk of a DAG.
 /// Appends each discovered CID to the .cids file (never holds full list in memory).
-/// Uses a bloom filter for dedup (~10 bits per item, 1% FPR).
+/// Uses HashMap for DAGs under 1M blocks (0% FPR) or BloomFilter for larger DAGs.
 /// Returns the manifest with status=ready.
 pub fn createManifest(
     allocator: std.mem.Allocator,
@@ -398,19 +455,31 @@ pub fn createManifest(
 
     // Check if .cids file already exists (crash recovery: resume from existing)
     var existing_count: u64 = 0;
-    var bloom = try BloomFilter.init(allocator, 1_000_000); // start with 1M estimate
-    defer bloom.deinit(allocator);
 
-    // Rebuild bloom from existing .cids if resuming
+    // Count existing CIDs first to choose dedup strategy
     if (std.fs.cwd().readFileAlloc(allocator, cids_path, 1 << 30)) |existing_data| {
         defer allocator.free(existing_data);
-        var line_it = std.mem.splitScalar(u8, existing_data, '\n');
-        while (line_it.next()) |line| {
-            if (line.len == 0) continue;
-            bloom.add(line);
-            existing_count += 1;
+        var count_it = std.mem.splitScalar(u8, existing_data, '\n');
+        while (count_it.next()) |line| {
+            if (line.len > 0) existing_count += 1;
         }
     } else |_| {}
+
+    // Use HashMap for <1M items (0% FPR), BloomFilter for larger DAGs (memory-efficient)
+    var dedup = try DedupSet.init(allocator, existing_count);
+    defer dedup.deinit(allocator);
+
+    // Rebuild dedup set from existing .cids if resuming
+    if (existing_count > 0) {
+        if (std.fs.cwd().readFileAlloc(allocator, cids_path, 1 << 30)) |existing_data| {
+            defer allocator.free(existing_data);
+            var line_it = std.mem.splitScalar(u8, existing_data, '\n');
+            while (line_it.next()) |line| {
+                if (line.len == 0) continue;
+                dedup.add(allocator, line) catch {};
+            }
+        } else |_| {}
+    }
 
     // Open .cids for append
     const cids_file = try std.fs.cwd().createFile(cids_path, .{ .truncate = false });
@@ -425,7 +494,7 @@ pub fn createManifest(
     }
 
     // Start from root if not already visited
-    if (!bloom.mightContain(root_cid)) {
+    if (!dedup.contains(root_cid)) {
         try work.append(allocator, try allocator.dupe(u8, root_cid));
     }
 
@@ -436,8 +505,8 @@ pub fn createManifest(
         const key = work.pop() orelse break;
         defer allocator.free(key);
 
-        if (bloom.mightContain(key)) continue;
-        bloom.add(key);
+        if (dedup.contains(key)) continue;
+        dedup.add(allocator, key) catch continue;
 
         // Write CID to .cids file (propagate errors to avoid silent data loss)
         try cids_file.writeAll(key);
@@ -461,7 +530,7 @@ pub fn createManifest(
         }
 
         for (children) |child| {
-            if (!bloom.mightContain(child)) {
+            if (!dedup.contains(child)) {
                 try work.append(allocator, try allocator.dupe(u8, child));
             }
         }
