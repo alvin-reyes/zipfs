@@ -122,11 +122,20 @@ fn drainInbox(allocator: std.mem.Allocator, ctx: *SchedulerCtx) void {
     // Use the queue's allocator for CID strings to ensure consistent allocator on free
     const q_alloc = ctx.queue.allocator;
 
-    // Parse lines and enqueue
+    // Parse lines and enqueue. Format: "CID" or "CID:N" where N is replication factor.
     var line_it = std.mem.splitScalar(u8, data, '\n');
     while (line_it.next()) |line| {
         if (line.len == 0) continue;
-        const cid_dup = q_alloc.dupe(u8, line) catch continue;
+        var repl_factor: u8 = 0; // 0 = use default
+        var cid_part = line;
+        if (std.mem.lastIndexOfScalar(u8, line, ':')) |colon| {
+            const factor_str = line[colon + 1 ..];
+            if (std.fmt.parseInt(u8, factor_str, 10)) |f| {
+                repl_factor = f;
+                cid_part = line[0..colon];
+            } else |_| {}
+        }
+        const cid_dup = q_alloc.dupe(u8, cid_part) catch continue;
         ctx.queue.push(.{
             .cid = cid_dup,
             .mode = ctx.cluster_mode,
@@ -134,6 +143,7 @@ fn drainInbox(allocator: std.mem.Allocator, ctx: *SchedulerCtx) void {
             .enqueued_ns = std.time.nanoTimestamp(),
             .target_peer = null,
             .shard_index = null,
+            .replication_factor = repl_factor,
         });
     }
 
@@ -190,17 +200,18 @@ fn processItem(allocator: std.mem.Allocator, ctx: *SchedulerCtx, item: *ReplItem
         // Auto-select peers and replicate/shard
         switch (item.mode) {
             .replicate => {
+                const factor = if (item.replication_factor > 0) item.replication_factor else ctx.replication_factor;
                 replication.replicateCid(
                     allocator,
                     &state,
                     ctx.store,
                     item.cid,
-                    ctx.replication_factor,
+                    factor,
                     ctx.cluster_secret,
                     ctx.ed25519_secret64,
                 ) catch {
-                    // Re-enqueue with lower priority on failure
-                    reEnqueueWithRetry(ctx, item.cid, item.mode, .retry_high, null, null, item.retry_count);
+                    // Re-enqueue with higher priority on failure, preserving per-item factor
+                    reEnqueueWithRetryAndFactor(ctx, item.cid, item.mode, .retry_high, null, null, item.retry_count, item.replication_factor);
                     state.save(ctx.repo_root) catch |e| {
                         std.log.err("cluster state save failed: {}", .{e});
                     };
@@ -217,7 +228,7 @@ fn processItem(allocator: std.mem.Allocator, ctx: *SchedulerCtx, item: *ReplItem
                     ctx.cluster_secret,
                     ctx.ed25519_secret64,
                 ) catch {
-                    reEnqueueWithRetry(ctx, item.cid, item.mode, .retry_high, null, null, item.retry_count);
+                    reEnqueueWithRetryAndFactor(ctx, item.cid, item.mode, .retry_high, null, null, item.retry_count, item.replication_factor);
                     state.save(ctx.repo_root) catch |e| {
                         std.log.err("cluster state save failed: {}", .{e});
                     };
@@ -312,6 +323,19 @@ fn reEnqueueWithRetry(
     shard_index: ?u16,
     retry_count: u8,
 ) void {
+    reEnqueueWithRetryAndFactor(ctx, cid_str, mode, priority, target_peer, shard_index, retry_count, 0);
+}
+
+fn reEnqueueWithRetryAndFactor(
+    ctx: *SchedulerCtx,
+    cid_str: []const u8,
+    mode: ClusterMode,
+    priority: repl_queue.Priority,
+    target_peer: ?[]const u8,
+    shard_index: ?u16,
+    retry_count: u8,
+    repl_factor: u8,
+) void {
     // Drop items that exceed max retries — self-healing will catch them
     if (retry_count >= repl_queue.max_repl_retries) return;
 
@@ -330,6 +354,7 @@ fn reEnqueueWithRetry(
         .target_peer = peer_dup,
         .shard_index = shard_index,
         .retry_count = retry_count + 1,
+        .replication_factor = repl_factor,
     });
 }
 

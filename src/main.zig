@@ -448,12 +448,18 @@ pub fn main() !void {
             try stderr.print("HTTP API: POST http://127.0.0.1:{d}/api/v0/add (Kubo-compatible)\n", .{cfg.gateway_port});
             try stderr.writeAll("Ctrl+C to stop.\n\n");
             try stderr.flush();
+            const pid_str = try zipfs.net_peer_id.peerIdString(gpa, &pub_bytes);
             const gw_ctx = zipfs.gateway.GatewayCtx{
                 .store = &node.store,
                 .store_sync = &sync_mu,
                 .repo_root = repo_root,
                 .chunk_size = cfg.chunk_size,
                 .port = cfg.gateway_port,
+                .peer_id = pid_str,
+                .listen_addrs = cfg.listen_addrs,
+                .announce_addrs = cfg.announce_addrs,
+                .cluster_peers = cfg.cluster_peers,
+                .replication_factor = cfg.replication_factor orelse 2,
             };
             try zipfs.gateway.run(gpa, &gw_ctx);
         } else {
@@ -462,12 +468,21 @@ pub fn main() !void {
             try stderr.print("gateway on 0.0.0.0:{d}\n", .{cfg.gateway_port});
             try stderr.print("HTTP API: POST http://127.0.0.1:{d}/api/v0/add (Kubo-compatible)\n", .{cfg.gateway_port});
             try stderr.flush();
+            const gw_sk = try std.crypto.sign.Ed25519.SecretKey.fromBytes(sec);
+            const gw_kp = try std.crypto.sign.Ed25519.KeyPair.fromSecretKey(gw_sk);
+            const gw_pub = gw_kp.public_key.toBytes();
+            const gw_pid = try zipfs.net_peer_id.peerIdString(gpa, &gw_pub);
             const gw_ctx = zipfs.gateway.GatewayCtx{
                 .store = &node.store,
                 .store_sync = null,
                 .repo_root = repo_root,
                 .chunk_size = cfg.chunk_size,
                 .port = cfg.gateway_port,
+                .peer_id = gw_pid,
+                .listen_addrs = cfg.listen_addrs,
+                .announce_addrs = cfg.announce_addrs,
+                .cluster_peers = cfg.cluster_peers,
+                .replication_factor = cfg.replication_factor orelse 2,
             };
             try zipfs.gateway.run(gpa, &gw_ctx);
         }

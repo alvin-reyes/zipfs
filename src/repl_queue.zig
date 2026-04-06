@@ -25,6 +25,8 @@ pub const ReplItem = struct {
     target_peer: ?[]const u8,
     shard_index: ?u16,
     retry_count: u8 = 0,
+    /// Per-item replication factor (0 = use ctx default).
+    replication_factor: u8 = 0,
 
     pub fn deinit(self: *ReplItem, allocator: std.mem.Allocator) void {
         allocator.free(self.cid);

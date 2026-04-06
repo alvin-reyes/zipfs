@@ -14,6 +14,16 @@ pub const GatewayCtx = struct {
     repo_root: []const u8,
     chunk_size: u32 = 262144,
     port: u16 = 8080,
+    /// Node identity: PeerID string (e.g. "QmXyz..."), set by caller.
+    peer_id: ?[]const u8 = null,
+    /// Addresses this node listens on (multiaddr strings).
+    listen_addrs: []const []const u8 = &.{},
+    /// Addresses this node announces to the network.
+    announce_addrs: []const []const u8 = &.{},
+    /// Cluster peer addresses.
+    cluster_peers: []const []const u8 = &.{},
+    /// Replication factor (0 = not configured).
+    replication_factor: u8 = 0,
 };
 
 fn sendResp(stream: std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) void {
@@ -256,14 +266,18 @@ fn handleAdd(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.n
     }
     const cid_str = cid_buf[0..cid_len];
 
-    // Parse query params for ?pin= (default true)
+    // Parse query params for ?pin= (default true) and ?replication=N
     var do_pin = true;
+    var repl_factor: u8 = 0; // 0 = use cluster default
     if (std.mem.indexOf(u8, target, "?")) |qmark| {
         const query = target[qmark + 1 ..];
         if (getQueryParam(query, "pin")) |val| {
             if (std.mem.eql(u8, val, "false") or std.mem.eql(u8, val, "0")) {
                 do_pin = false;
             }
+        }
+        if (getQueryParam(query, "replication")) |val| {
+            repl_factor = std.fmt.parseInt(u8, val, 10) catch 0;
         }
     }
 
@@ -280,7 +294,7 @@ fn handleAdd(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.n
         pins.save(allocator, ctx.repo_root) catch |err| {
             std.log.err("pin save failed: {}", .{err});
         };
-        pin.notifyInbox(allocator, ctx.repo_root, cid_str) catch {};
+        pin.notifyInboxWithFactor(allocator, ctx.repo_root, cid_str, repl_factor) catch {};
     }
 
     // Kubo-compatible NDJSON response (with JSON-escaped filename)
@@ -305,6 +319,48 @@ fn handleAdd(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.n
         "HTTP/1.1 200 OK",
         "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n",
         json_resp,
+    );
+}
+
+fn handleId(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.net.Stream) void {
+    // Build addresses JSON array
+    var addrs_buf: std.ArrayList(u8) = .empty;
+    defer addrs_buf.deinit(allocator);
+    addrs_buf.appendSlice(allocator, "[") catch return;
+    const all_addrs = if (ctx.announce_addrs.len > 0) ctx.announce_addrs else ctx.listen_addrs;
+    for (all_addrs, 0..) |addr, i| {
+        if (i > 0) addrs_buf.appendSlice(allocator, ",") catch continue;
+        addrs_buf.appendSlice(allocator, "\"") catch continue;
+        addrs_buf.appendSlice(allocator, addr) catch continue;
+        addrs_buf.appendSlice(allocator, "\"") catch continue;
+    }
+    addrs_buf.appendSlice(allocator, "]") catch return;
+
+    // Build cluster peers JSON array
+    var peers_buf: std.ArrayList(u8) = .empty;
+    defer peers_buf.deinit(allocator);
+    peers_buf.appendSlice(allocator, "[") catch return;
+    for (ctx.cluster_peers, 0..) |peer, i| {
+        if (i > 0) peers_buf.appendSlice(allocator, ",") catch continue;
+        peers_buf.appendSlice(allocator, "\"") catch continue;
+        peers_buf.appendSlice(allocator, peer) catch continue;
+        peers_buf.appendSlice(allocator, "\"") catch continue;
+    }
+    peers_buf.appendSlice(allocator, "]") catch return;
+
+    const pid = ctx.peer_id orelse "unknown";
+    const resp = std.fmt.allocPrint(
+        allocator,
+        "{{\"ID\":\"{s}\",\"Addresses\":{s},\"ClusterPeers\":{s},\"ReplicationFactor\":{d}}}\n",
+        .{ pid, addrs_buf.items, peers_buf.items, ctx.replication_factor },
+    ) catch return;
+    defer allocator.free(resp);
+
+    sendRespWithHeaders(
+        stream,
+        "HTTP/1.1 200 OK",
+        "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n",
+        resp,
     );
 }
 
@@ -352,7 +408,7 @@ pub fn run(allocator: std.mem.Allocator, ctx: *const GatewayCtx) !void {
         // Find headers section (everything after request line)
         const headers = req[line_end + 2 ..];
 
-        // Route: POST /api/v0/add
+        // Route: POST /api/v0/add or POST /api/v0/id
         if (is_post) {
             const target_path = if (std.mem.indexOf(u8, target, "?")) |q| target[0..q] else target;
             if (std.mem.eql(u8, target_path, "/api/v0/add")) {
@@ -363,8 +419,21 @@ pub fn run(allocator: std.mem.Allocator, ctx: *const GatewayCtx) !void {
                 handleAdd(allocator, ctx, conn.stream, headers, initial_body, target);
                 continue;
             }
+            if (std.mem.eql(u8, target_path, "/api/v0/id")) {
+                handleId(allocator, ctx, conn.stream);
+                continue;
+            }
             sendResp(conn.stream, "HTTP/1.1 404 Not Found", "text/plain", "not found\n");
             continue;
+        }
+
+        // Route: GET /api/v0/id
+        {
+            const get_path = if (std.mem.indexOf(u8, target, "?")) |q| target[0..q] else target;
+            if (std.mem.eql(u8, get_path, "/api/v0/id")) {
+                handleId(allocator, ctx, conn.stream);
+                continue;
+            }
         }
 
         // Route: GET /health (for Railway/Docker healthchecks)
