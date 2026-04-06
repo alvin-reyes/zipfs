@@ -518,7 +518,7 @@ pub fn processRetryQueue(
                 };
                 defer allocator.free(hp.host);
 
-                if (cluster_push.dialClusterPing(allocator, hp.host, hp.port, cluster_secret, ed25519_secret64)) {
+                if (cluster_push.dialClusterPing(allocator, hp.host, hp.port, cluster_secret, ed25519_secret64) catch false) {
                     success = true;
                 } else {
                     // Peer still down
