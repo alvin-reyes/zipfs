@@ -108,7 +108,7 @@ pub fn collectDagBlocks(
     try work.append(allocator, initial);
 
     while (work.items.len > 0) {
-        const key = work.pop();
+        const key = work.pop() orelse break;
         defer allocator.free(key);
 
         if (visited.contains(key)) continue;
@@ -581,7 +581,7 @@ pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
         const hp = cluster_push.parseHostPort(allocator, peer.addr) catch continue;
         defer allocator.free(hp.host);
 
-        const alive = cluster_push.dialClusterPing(allocator, hp.host, hp.port, ctx.cluster_secret, ctx.ed25519_secret64);
+        const alive = cluster_push.dialClusterPing(allocator, hp.host, hp.port, ctx.cluster_secret, ctx.ed25519_secret64) catch false;
         if (alive) {
             peer.is_alive = true;
             peer.consecutive_failures = 0;

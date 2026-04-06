@@ -91,10 +91,10 @@ pub const ReplQueue = struct {
         }
 
         // Binary search for correct insertion position: O(log n) instead of O(n log n) full sort
-        const len = self.items.items.len;
+        const item_count = self.items.items.len;
         const insert_pos = blk: {
             var lo: usize = 0;
-            var hi: usize = len;
+            var hi: usize = item_count;
             while (lo < hi) {
                 const mid = lo + (hi - lo) / 2;
                 if (ReplItem.orderLessThan({}, self.items.items[mid], item)) {

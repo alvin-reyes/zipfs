@@ -269,18 +269,18 @@ fn handleAdd(allocator: std.mem.Allocator, ctx: *const GatewayCtx, stream: std.n
 
     // Pin + notify replication (outside store lock — file I/O only)
     if (do_pin) {
-        if (pin.PinSet.load(allocator, ctx.repo_root)) |*pins| {
-            defer pins.deinit(allocator);
-            pins.pinDirect(allocator, cid_str) catch |err| {
-                std.log.err("pinDirect failed: {}", .{err});
-            };
-            pins.save(allocator, ctx.repo_root) catch |err| {
-                std.log.err("pin save failed: {}", .{err});
-            };
-            pin.notifyInbox(allocator, ctx.repo_root, cid_str) catch {};
-        } else |err| {
+        var pins = pin.PinSet.load(allocator, ctx.repo_root) catch |err| {
             std.log.err("PinSet.load failed: {}", .{err});
-        }
+            return;
+        };
+        defer pins.deinit(allocator);
+        pins.pinDirect(allocator, cid_str) catch |err| {
+            std.log.err("pinDirect failed: {}", .{err});
+        };
+        pins.save(allocator, ctx.repo_root) catch |err| {
+            std.log.err("pin save failed: {}", .{err});
+        };
+        pin.notifyInbox(allocator, ctx.repo_root, cid_str) catch {};
     }
 
     // Kubo-compatible NDJSON response (with JSON-escaped filename)
