@@ -10,6 +10,7 @@ const config_mod = @import("config.zig");
 const cluster_push = @import("net/cluster_push.zig");
 const multiaddr = @import("net/multiaddr.zig");
 const repl_queue_mod = @import("repl_queue.zig");
+const manifest_mod = @import("manifest.zig");
 
 const ClusterState = cluster_mod.ClusterState;
 const ClusterPeer = cluster_mod.ClusterPeer;
@@ -86,7 +87,7 @@ pub fn selectPeersConsistentHash(
 /// Collect all block CID strings in a DAG recursively (including root).
 pub fn collectDagBlocks(
     allocator: std.mem.Allocator,
-    store: *const Blockstore,
+    store: *Blockstore,
     root_key: []const u8,
 ) ![][]u8 {
     var visited = std.StringHashMapUnmanaged(void).empty;
@@ -142,7 +143,7 @@ pub fn collectDagBlocks(
 /// Classify blocks into structure (dag-pb intermediate) and data (raw leaf) nodes.
 pub fn classifyBlocks(
     allocator: std.mem.Allocator,
-    store: *const Blockstore,
+    store: *Blockstore,
     block_keys: []const []const u8,
 ) !struct { structure: [][]const u8, data_blocks: [][]const u8 } {
     var structure = std.ArrayList([]const u8).empty;
@@ -194,7 +195,7 @@ pub fn shardForBlock(block_cid: []const u8, shard_count: u16) u16 {
 /// Build block entries from blockstore for a set of CID keys.
 pub fn buildBlockEntries(
     allocator: std.mem.Allocator,
-    store: *const Blockstore,
+    store: *Blockstore,
     keys: []const []const u8,
 ) ![]cluster_push.BlockEntry {
     var entries = std.ArrayList(cluster_push.BlockEntry).empty;
@@ -207,13 +208,18 @@ pub fn buildBlockEntries(
     }
 
     for (keys) |key| {
-        const data = store.get(key) orelse continue;
-        var c = Cid.parse(allocator, key) catch continue;
-        defer c.deinit(allocator);
-        const cid_bytes = c.toBytes(allocator) catch continue;
-        errdefer allocator.free(cid_bytes);
-        const data_owned = try allocator.dupe(u8, data);
+        const data_owned = store.get(allocator, key) orelse continue;
         errdefer allocator.free(data_owned);
+        var c = Cid.parse(allocator, key) catch {
+            allocator.free(data_owned);
+            continue;
+        };
+        defer c.deinit(allocator);
+        const cid_bytes = c.toBytes(allocator) catch {
+            allocator.free(data_owned);
+            continue;
+        };
+        errdefer allocator.free(cid_bytes);
         try entries.append(allocator, .{ .cid_bytes = cid_bytes, .data = data_owned });
     }
 
@@ -229,22 +235,79 @@ pub fn freeBlockEntries(allocator: std.mem.Allocator, entries: []cluster_push.Bl
     allocator.free(entries);
 }
 
+/// Push entries to a peer in batches that each fit within the yamux frame budget.
+/// The yamux frame size is capped at 4MB, so we target ≤3MB per batch (≈1MB headroom
+/// for protobuf field tags, the cluster_push envelope, and the per-frame ACK round trip).
+/// If any batch fails, the error is returned and the remaining batches are not sent.
+fn pushEntriesBatched(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    cid_str: []const u8,
+    entries: []const cluster_push.BlockEntry,
+    cluster_secret: ?[]const u8,
+    ed25519_secret64: [64]u8,
+) !void {
+    if (entries.len == 0) return;
+
+    const max_batch_bytes: usize = 3 * 1024 * 1024;
+    // Per-entry protobuf overhead: 2 field tags + 2 length varints ≈ 16 bytes worst case.
+    const per_entry_overhead: usize = 16;
+
+    var batch_start: usize = 0;
+    var batch_size: usize = 0;
+
+    var i: usize = 0;
+    while (i < entries.len) : (i += 1) {
+        const entry_size = entries[i].cid_bytes.len + entries[i].data.len + per_entry_overhead;
+
+        // Flush current batch if it has at least one entry and adding this one would overflow.
+        if (i > batch_start and batch_size + entry_size > max_batch_bytes) {
+            _ = try cluster_push.dialClusterPush(
+                allocator,
+                host,
+                port,
+                cid_str,
+                entries[batch_start..i],
+                cluster_secret,
+                ed25519_secret64,
+            );
+            batch_start = i;
+            batch_size = 0;
+        }
+        batch_size += entry_size;
+    }
+
+    // Final batch (always non-empty if we got here).
+    _ = try cluster_push.dialClusterPush(
+        allocator,
+        host,
+        port,
+        cid_str,
+        entries[batch_start..],
+        cluster_secret,
+        ed25519_secret64,
+    );
+}
+
 /// Replicate a CID's full DAG to N cluster peers.
 pub fn replicateCid(
     allocator: std.mem.Allocator,
     state: *ClusterState,
-    store: *const Blockstore,
+    store: *Blockstore,
     cid_str: []const u8,
     target_n: u8,
     cluster_secret: ?[]const u8,
     ed25519_secret64: [64]u8,
 ) !void {
     // Collect all blocks in DAG
+    std.debug.print("[repl] collectDagBlocks for {s}\n", .{cid_str});
     const all_blocks = try collectDagBlocks(allocator, store, cid_str);
     defer {
         for (all_blocks) |b| allocator.free(b);
         allocator.free(all_blocks);
     }
+    std.debug.print("[repl] collected {d} blocks\n", .{all_blocks.len});
 
     // Ensure replica record exists
     _ = try state.upsertReplica(cid_str, .replicate, target_n);
@@ -252,6 +315,7 @@ pub fn replicateCid(
     // Get alive peers
     const alive = try state.alivePeers(allocator);
     defer allocator.free(alive);
+    std.debug.print("[repl] alive peers: {d}\n", .{alive.len});
 
     // Get current confirmed peers for this CID
     const rec = state.replicas.getPtr(cid_str) orelse return;
@@ -259,6 +323,7 @@ pub fn replicateCid(
 
     // Select new peers
     const needed: usize = if (target_n > already_confirmed.len) target_n - already_confirmed.len else 0;
+    std.debug.print("[repl] needed={d} already_confirmed={d}\n", .{ needed, already_confirmed.len });
     if (needed == 0) return;
 
     const selected = try selectPeersConsistentHash(allocator, alive, cid_str, needed, already_confirmed);
@@ -269,15 +334,18 @@ pub fn replicateCid(
     defer freeBlockEntries(allocator, entries);
 
     // Push to each selected peer and track confirmations
+    std.debug.print("[repl] pushing {d} entries to {d} peers\n", .{ entries.len, selected.len });
     var confirmed_count: usize = already_confirmed.len;
     for (selected) |peer| {
         const hp = cluster_push.parseHostPort(allocator, peer.addr) catch {
+            std.debug.print("[repl] parseHostPort failed for {s}\n", .{peer.addr});
             try state.addRetry(.push_blocks, cid_str, peer.addr, null);
             continue;
         };
         defer allocator.free(hp.host);
 
-        _ = cluster_push.dialClusterPush(
+        std.debug.print("[repl] pushing to {s}:{d}\n", .{ hp.host, hp.port });
+        pushEntriesBatched(
             allocator,
             hp.host,
             hp.port,
@@ -285,11 +353,13 @@ pub fn replicateCid(
             entries,
             cluster_secret,
             ed25519_secret64,
-        ) catch {
+        ) catch |err| {
+            std.debug.print("[repl] push FAILED to {s}:{d}: {}\n", .{ hp.host, hp.port, err });
             try state.addRetry(.push_blocks, cid_str, peer.addr, null);
             continue;
         };
 
+        std.debug.print("[repl] push OK to {s}:{d}\n", .{ hp.host, hp.port });
         try state.addConfirmedPeer(cid_str, peer.addr);
         confirmed_count += 1;
     }
@@ -305,7 +375,7 @@ pub fn replicateCid(
 pub fn shardCid(
     allocator: std.mem.Allocator,
     state: *ClusterState,
-    store: *const Blockstore,
+    store: *Blockstore,
     cid_str: []const u8,
     shard_count: u16,
     cluster_secret: ?[]const u8,
@@ -338,7 +408,7 @@ pub fn shardCid(
         for (alive) |peer| {
             const hp = cluster_push.parseHostPort(allocator, peer.addr) catch continue;
             defer allocator.free(hp.host);
-            _ = cluster_push.dialClusterPush(
+            pushEntriesBatched(
                 allocator,
                 hp.host,
                 hp.port,
@@ -383,7 +453,7 @@ pub fn shardCid(
         const hp = cluster_push.parseHostPort(allocator, peer.addr) catch continue;
         defer allocator.free(hp.host);
 
-        _ = cluster_push.dialClusterPush(
+        pushEntriesBatched(
             allocator,
             hp.host,
             hp.port,
@@ -402,11 +472,11 @@ pub fn shardCid(
 pub fn processRetryQueue(
     allocator: std.mem.Allocator,
     state: *ClusterState,
-    store: *const Blockstore,
+    store: *Blockstore,
     cluster_secret: ?[]const u8,
     ed25519_secret64: [64]u8,
 ) void {
-    const now = std.time.nanoTimestamp();
+    const now: i64 = @intCast(std.time.nanoTimestamp());
     var i: usize = 0;
     while (i < state.retry_queue.items.len) {
         var entry = &state.retry_queue.items[i];
@@ -455,7 +525,7 @@ pub fn processRetryQueue(
                 };
                 defer allocator.free(hp.host);
 
-                if (cluster_push.dialClusterPush(
+                if (pushEntriesBatched(
                     allocator,
                     hp.host,
                     hp.port,
@@ -496,7 +566,7 @@ pub fn processRetryQueue(
                 };
                 defer allocator.free(hp.host);
 
-                if (cluster_push.dialClusterPush(
+                if (pushEntriesBatched(
                     allocator,
                     hp.host,
                     hp.port,
@@ -568,12 +638,15 @@ pub fn selfHealingLoop(ctx: *SelfHealCtx) void {
 }
 
 /// Run a single self-healing cycle (public for `cluster sync`).
+/// No external blockstore lock needed — Blockstore is internally thread-safe via cache_mu.
+/// state_mu is narrowed to file I/O only (load/save) to prevent blocking during liveness pings and network pushes.
 pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
-    // Lock state_mu to prevent concurrent ClusterState load/save races with the scheduler
-    if (ctx.state_mu) |smu| smu.lock();
-    defer if (ctx.state_mu) |smu| smu.unlock();
-
-    var state = ClusterState.load(allocator, ctx.repo_root) catch return;
+    // Load cluster state under state_mu (protects file access only)
+    var state = blk: {
+        if (ctx.state_mu) |smu| smu.lock();
+        defer if (ctx.state_mu) |smu| smu.unlock();
+        break :blk ClusterState.load(allocator, ctx.repo_root) catch return;
+    };
     defer state.deinit();
 
     // 1. Liveness check: ping each peer
@@ -585,7 +658,7 @@ pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
         if (alive) {
             peer.is_alive = true;
             peer.consecutive_failures = 0;
-            peer.last_seen_ns = std.time.nanoTimestamp();
+            peer.last_seen_ns = @intCast(std.time.nanoTimestamp());
         } else {
             peer.consecutive_failures +|= 1;
             if (peer.consecutive_failures >= 3) {
@@ -684,13 +757,13 @@ pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
                 .cid = cid_dup,
                 .mode = item.mode,
                 .priority = .heal,
-                .enqueued_ns = std.time.nanoTimestamp(),
+                .enqueued_ns = @intCast(std.time.nanoTimestamp()),
                 .target_peer = null,
                 .shard_index = null,
             });
         } else {
-            // CLI mode: perform repair directly, holding sync_mu for blockstore safety
-            ctx.mu.lock();
+            // CLI mode: perform repair directly
+            // No external lock needed — Blockstore is internally thread-safe via cache_mu
             switch (item.mode) {
                 .replicate => {
                     replicateCid(
@@ -715,17 +788,62 @@ pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
                     ) catch {};
                 },
             }
-            ctx.mu.unlock();
         }
     }
 
-    // 4. Process retry queue (holds sync_mu for blockstore safety)
-    ctx.mu.lock();
+    // 4. Process retry queue (no external lock — Blockstore is internally thread-safe)
     processRetryQueue(allocator, &state, ctx.store, ctx.cluster_secret, ctx.ed25519_secret64);
-    ctx.mu.unlock();
 
-    // 5. Save state atomically
-    state.save(ctx.repo_root) catch |e| {
-        std.log.err("cluster state save failed: {}", .{e});
-    };
+    // 5. Monitor active manifests: check peer progress, mark complete, re-notify stale peers
+    monitorManifests(allocator, ctx);
+
+    // 6. Merge-on-save: reload fresh state, merge changes, save (TOCTOU fix)
+    state.mergeSave(ctx.repo_root, ctx.state_mu);
+}
+
+/// Monitor active manifests: check peer progress, mark complete, re-notify stale peers.
+fn monitorManifests(allocator: std.mem.Allocator, ctx: *SelfHealCtx) void {
+    const manifests = manifest_mod.Manifest.loadAll(allocator, ctx.repo_root) catch return;
+    defer {
+        for (manifests) |*m| m.deinit(allocator);
+        allocator.free(manifests);
+    }
+
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const stale_threshold_ns: i64 = 5 * 60 * std.time.ns_per_s; // 5 minutes
+
+    for (manifests) |*m| {
+        if (m.status != .ready and m.status != .active) continue;
+
+        var all_complete = true;
+        var any_stale = false;
+
+        for (m.target_peers) |*peer| {
+            if (peer.status == .complete) continue;
+            all_complete = false;
+
+            // Check for stale peers (no activity in 5 minutes)
+            if (now - peer.last_activity_ns > stale_threshold_ns) {
+                any_stale = true;
+                peer.status = .pending; // Reset to trigger re-notification
+            }
+        }
+
+        if (all_complete) {
+            m.status = .complete;
+            m.updated_ns = now;
+            m.save(allocator, ctx.repo_root) catch |e| {
+                std.log.err("manifest save failed for {s}: {}", .{ m.root_cid, e });
+            };
+            continue;
+        }
+
+        if (any_stale) {
+            m.status = .active;
+            m.updated_ns = now;
+            m.save(allocator, ctx.repo_root) catch |e| {
+                std.log.warn("manifest save failed for {s}: {}", .{ m.root_cid, e });
+            };
+        }
+    }
 }

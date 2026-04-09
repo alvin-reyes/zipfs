@@ -22,7 +22,7 @@ pub const PinSet = struct {
     pub fn load(allocator: std.mem.Allocator, repo_root: []const u8) !PinSet {
         const path = try std.fs.path.join(allocator, &.{ repo_root, "pins.json" });
         defer allocator.free(path);
-        const data = std.fs.cwd().readFileAlloc(allocator, path, 1 << 20) catch |err| switch (err) {
+        const data = std.fs.cwd().readFileAlloc(allocator, path, 64 << 20) catch |err| switch (err) {
             error.FileNotFound => return .{},
             else => |e| return e,
         };
@@ -150,7 +150,7 @@ pub fn notifyInboxWithFactor(allocator: std.mem.Allocator, repo_root: []const u8
     try file.sync();
 }
 
-fn markRecursive(allocator: std.mem.Allocator, store: *const Blockstore, key: []const u8, marked: *std.StringHashMapUnmanaged(void)) !void {
+fn markRecursive(allocator: std.mem.Allocator, store: *Blockstore, key: []const u8, marked: *std.StringHashMapUnmanaged(void)) !void {
     if (marked.contains(key)) return;
     const owned = try allocator.dupe(u8, key);
     marked.put(allocator, owned, {}) catch |err| {
@@ -166,7 +166,7 @@ fn markRecursive(allocator: std.mem.Allocator, store: *const Blockstore, key: []
     for (kids) |c| try markRecursive(allocator, store, c, marked);
 }
 
-/// Remove unpinned blocks from memory store and sharded disk. Returns count removed.
+/// Remove unpinned blocks from sharded disk. Returns count removed.
 pub fn gc(allocator: std.mem.Allocator, store: *Blockstore, pins: *const PinSet, repo_root: []const u8) !usize {
     var marked: std.StringHashMapUnmanaged(void) = .empty;
     defer {
@@ -177,7 +177,7 @@ pub fn gc(allocator: std.mem.Allocator, store: *Blockstore, pins: *const PinSet,
 
     {
         var it = pins.recursive.keyIterator();
-        while (it.next()) |k| try markRecursive(allocator, store, k.*, &marked);
+        while (it.next()) |k| markRecursive(allocator, store, k.*, &marked) catch {};
     }
     {
         var it = pins.direct.keyIterator();
@@ -188,19 +188,44 @@ pub fn gc(allocator: std.mem.Allocator, store: *Blockstore, pins: *const PinSet,
         }
     }
 
+    // Walk disk blocks directory to find all block CID keys
     var keys = std.ArrayList([]const u8).empty;
     defer {
         for (keys.items) |x| allocator.free(x);
         keys.deinit(allocator);
     }
-    var sit = store.map.iterator();
-    while (sit.next()) |e| try keys.append(allocator, try allocator.dupe(u8, e.key_ptr.*));
+
+    const blocks_base = try std.fs.path.join(allocator, &.{ repo_root, "blocks" });
+    defer allocator.free(blocks_base);
+
+    var base_dir = std.fs.cwd().openDir(blocks_base, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => |e| return e,
+    };
+    defer base_dir.close();
+
+    var it = base_dir.iterate();
+    while (try it.next()) |ent| {
+        if (ent.kind != .directory or ent.name.len != 2) continue;
+        var sub = base_dir.openDir(ent.name, .{ .iterate = true }) catch continue;
+        defer sub.close();
+        var it2 = sub.iterate();
+        while (try it2.next()) |e2| {
+            if (e2.kind != .directory or e2.name.len != 2) continue;
+            var sub2 = sub.openDir(e2.name, .{ .iterate = true }) catch continue;
+            defer sub2.close();
+            var it3 = sub2.iterate();
+            while (try it3.next()) |e3| {
+                if (e3.kind != .file) continue;
+                try keys.append(allocator, try allocator.dupe(u8, e3.name));
+            }
+        }
+    }
 
     var removed: usize = 0;
     for (keys.items) |k| {
         if (marked.contains(k)) continue;
         _ = store.remove(allocator, k);
-        try repo.removeBlockFile(repo_root, k);
         removed += 1;
     }
     return removed;

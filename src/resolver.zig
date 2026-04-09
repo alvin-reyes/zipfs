@@ -155,7 +155,7 @@ fn pathSegments(allocator: std.mem.Allocator, path: []const u8) error{ OutOfMemo
 }
 
 /// Walk `root_key` + UnixFS path; returns owned CID string for the target node.
-pub fn resolvePathToKey(allocator: std.mem.Allocator, store: *const Blockstore, root_key_utf8: []const u8, path: []const u8) error{ OutOfMemory, NotFound, BadBlock, BadPath, NotADirectory, UnsupportedHamt }![]u8 {
+pub fn resolvePathToKey(allocator: std.mem.Allocator, store: *Blockstore, root_key_utf8: []const u8, path: []const u8) error{ OutOfMemory, NotFound, BadBlock, BadPath, NotADirectory, UnsupportedHamt }![]u8 {
     const segs = try pathSegments(allocator, path);
     defer allocator.free(segs);
 
@@ -163,7 +163,8 @@ pub fn resolvePathToKey(allocator: std.mem.Allocator, store: *const Blockstore, 
     errdefer allocator.free(cur);
 
     for (segs) |seg| {
-        const block = store.get(cur) orelse return error.NotFound;
+        const block = store.get(allocator, cur) orelse return error.NotFound;
+        defer allocator.free(block);
         var cidn = Cid.parse(allocator, cur) catch return error.BadBlock;
         defer cidn.deinit(allocator);
         if (cidn.codec != codec_dag_pb) return error.BadBlock;
@@ -192,17 +193,18 @@ pub fn resolvePathToKey(allocator: std.mem.Allocator, store: *const Blockstore, 
     return cur;
 }
 
-pub fn catFileAtPath(allocator: std.mem.Allocator, store: *const Blockstore, root_key_utf8: []const u8, path: []const u8) error{ OutOfMemory, NotFound, BadBlock, BadPath, NotADirectory, UnsupportedHamt }![]u8 {
+pub fn catFileAtPath(allocator: std.mem.Allocator, store: *Blockstore, root_key_utf8: []const u8, path: []const u8) error{ OutOfMemory, NotFound, BadBlock, BadPath, NotADirectory, UnsupportedHamt }![]u8 {
     const key = try resolvePathToKey(allocator, store, root_key_utf8, path);
     defer allocator.free(key);
     return try catFile(allocator, store, key);
 }
 
-pub fn listDirAtPath(allocator: std.mem.Allocator, store: *const Blockstore, root_key_utf8: []const u8, path: []const u8) error{ OutOfMemory, NotFound, BadBlock, BadPath, NotADirectory, UnsupportedHamt }!DirList {
+pub fn listDirAtPath(allocator: std.mem.Allocator, store: *Blockstore, root_key_utf8: []const u8, path: []const u8) error{ OutOfMemory, NotFound, BadBlock, BadPath, NotADirectory, UnsupportedHamt }!DirList {
     const key = try resolvePathToKey(allocator, store, root_key_utf8, path);
     defer allocator.free(key);
 
-    const block = store.get(key) orelse return error.NotFound;
+    const block = store.get(allocator, key) orelse return error.NotFound;
+    defer allocator.free(block);
     var cidn = Cid.parse(allocator, key) catch return error.BadBlock;
     defer cidn.deinit(allocator);
     if (cidn.codec != codec_dag_pb) return error.BadBlock;
@@ -271,8 +273,9 @@ fn parseDagPbNode(allocator: std.mem.Allocator, block: []const u8) error{ Trunca
     return .{ .ufs_msg = ufs_msg, .links = try links.toOwnedSlice(allocator) };
 }
 
-fn catInto(allocator: std.mem.Allocator, store: *const Blockstore, key_utf8: []const u8, out: *std.ArrayList(u8)) error{ OutOfMemory, NotFound, BadBlock }!void {
-    const block = store.get(key_utf8) orelse return error.NotFound;
+fn catInto(allocator: std.mem.Allocator, store: *Blockstore, key_utf8: []const u8, out: *std.ArrayList(u8)) error{ OutOfMemory, NotFound, BadBlock }!void {
+    const block = store.get(allocator, key_utf8) orelse return error.NotFound;
+    defer allocator.free(block);
 
     var root = Cid.parse(allocator, key_utf8) catch return error.BadBlock;
     defer root.deinit(allocator);
@@ -306,8 +309,9 @@ fn catInto(allocator: std.mem.Allocator, store: *const Blockstore, key_utf8: []c
 }
 
 /// Owned list of child CID strings referenced by a dag-pb block (empty for raw / non-dag).
-pub fn dagChildKeys(allocator: std.mem.Allocator, store: *const Blockstore, key_utf8: []const u8) error{ OutOfMemory, NotFound, BadBlock }![][]u8 {
-    const block = store.get(key_utf8) orelse return error.NotFound;
+pub fn dagChildKeys(allocator: std.mem.Allocator, store: *Blockstore, key_utf8: []const u8) error{ OutOfMemory, NotFound, BadBlock }![][]u8 {
+    const block = store.get(allocator, key_utf8) orelse return error.NotFound;
+    defer allocator.free(block);
     var root = Cid.parse(allocator, key_utf8) catch return error.BadBlock;
     defer root.deinit(allocator);
     if (root.codec == codec_raw) {
@@ -317,21 +321,21 @@ pub fn dagChildKeys(allocator: std.mem.Allocator, store: *const Blockstore, key_
     if (root.codec != codec_dag_pb) return error.BadBlock;
     const parsed = parseDagPbNode(allocator, block) catch return error.BadBlock;
     defer allocator.free(parsed.links);
-    var out = try allocator.alloc([]u8, parsed.links.len);
+    var out_arr = try allocator.alloc([]u8, parsed.links.len);
     errdefer {
-        for (out) |s| allocator.free(s);
-        allocator.free(out);
+        for (out_arr) |s| allocator.free(s);
+        allocator.free(out_arr);
     }
     for (parsed.links, 0..) |lnk, i| {
         const child = Cid.fromBytes(allocator, lnk.hash) catch return error.BadBlock;
         defer child.deinit(allocator);
-        out[i] = try child.toString(allocator);
+        out_arr[i] = try child.toString(allocator);
     }
-    return out;
+    return out_arr;
 }
 
 /// Returns owned slice of file payload.
-pub fn catFile(allocator: std.mem.Allocator, store: *const Blockstore, root_key_utf8: []const u8) error{ OutOfMemory, NotFound, BadBlock }![]u8 {
+pub fn catFile(allocator: std.mem.Allocator, store: *Blockstore, root_key_utf8: []const u8) error{ OutOfMemory, NotFound, BadBlock }![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try catInto(allocator, store, root_key_utf8, &buf);

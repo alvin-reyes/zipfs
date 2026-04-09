@@ -5,7 +5,7 @@ set -e
 if [ -n "$CLUSTER_PEERS" ]; then
   cat > "$IPFS_PATH/config.json" <<CONF
 {
-  "gateway_port": ${GATEWAY_PORT:-8080},
+  "gateway_port": ${GATEWAY_PORT:-${PORT:-8080}},
   "listen_addrs": ["/ip4/0.0.0.0/tcp/${SWARM_PORT:-4001}"],
   "announce_addrs": [],
   "cluster_peers": [${CLUSTER_PEERS}],

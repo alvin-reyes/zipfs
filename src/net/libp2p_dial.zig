@@ -137,13 +137,15 @@ pub const YamuxOverNoise = struct {
     }
 
     pub fn streamWrite(self: *YamuxOverNoise, stream_id: u32, payload: []const u8) !void {
-        if (payload.len > 256 * 1024) return error.MessageTooLong;
+        // Aligned with the 4MB frame size limit enforced in readFrame (max_frame_size).
+        // Callers pushing more than this must split into multiple stream writes.
+        if (payload.len > 4 * 1024 * 1024) return error.MessageTooLong;
         try self.writeFrame(.{
             .version = 0,
             .typ = .data,
             .flags = 0,
             .stream_id = stream_id,
-            .length = @truncate(payload.len),
+            .length = @intCast(payload.len),
         }, payload);
     }
 
@@ -207,7 +209,7 @@ pub const YamuxOverNoise = struct {
     }
 };
 
-fn multistreamSelectPlain(stream: std.net.Stream, buf: []u8) !void {
+pub fn multistreamSelectPlain(stream: std.net.Stream, buf: []u8) !void {
     try multistream.writeProtocol(stream, multistream.multistream_1_0);
     const a = try multistream.readLine(stream, buf);
     if (!std.mem.eql(u8, a, multistream.multistream_1_0[0 .. multistream.multistream_1_0.len - 1]))
@@ -224,7 +226,7 @@ pub fn multistreamRespondNoise(stream: std.net.Stream, buf: []u8) !void {
     try multistream.writeProtocol(stream, proto_noise);
 }
 
-fn negotiateYamuxOnNoise(s: *noise.Session, allocator: std.mem.Allocator) !void {
+pub fn negotiateYamuxOnNoise(s: *noise.Session, allocator: std.mem.Allocator) !void {
     try writeLineNoise(s, allocator, multistream.multistream_1_0);
     const l1 = try readLineNoise(s, allocator);
     defer allocator.free(l1);

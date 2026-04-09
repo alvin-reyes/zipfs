@@ -73,7 +73,8 @@ fn addDirFromOpenDir(allocator: std.mem.Allocator, store: *Blockstore, dir: std.
         var c = try Cid.parse(allocator, ch.key);
         defer c.deinit(allocator);
         const hb = try c.toBytes(allocator);
-        const blk = store.get(ch.key) orelse return error.MissingBlock;
+        const blk = store.get(allocator, ch.key) orelse return error.MissingBlock;
+        defer allocator.free(blk);
         try links.append(allocator, .{ .hash = hb, .name = ch.name, .tsize = @intCast(blk.len) });
     }
 

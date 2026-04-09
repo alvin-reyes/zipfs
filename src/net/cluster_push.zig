@@ -7,6 +7,9 @@ const blockstore = @import("../blockstore.zig");
 const cid_mod = @import("../cid.zig");
 const libp2p_dial = @import("libp2p_dial.zig");
 const multiaddr = @import("multiaddr.zig");
+const conn_pool = @import("conn_pool.zig");
+
+pub const ConnPool = conn_pool.ConnPool;
 
 pub const proto_cluster_push = "/zipfs/cluster/push/1.0.0\n";
 
@@ -18,6 +21,10 @@ pub const MsgType = enum(u8) {
     have_response = 3,
     ping = 4,
     pong = 5,
+    block_pull = 6,
+    block_pull_resp = 7,
+    manifest_notify = 8,
+    manifest_ack = 9,
 };
 
 /// Block entry within a push message.
@@ -346,4 +353,123 @@ pub fn parseHostPort(allocator: std.mem.Allocator, addr: []const u8) !struct { h
     defer t.deinit(allocator);
     const host = try allocator.dupe(u8, t.host);
     return .{ .host = host, .port = t.port };
+}
+
+/// Push blocks using a pooled connection. Falls back to fresh dial on failure.
+pub fn dialClusterPushPooled(
+    allocator: std.mem.Allocator,
+    pool: *ConnPool,
+    host: []const u8,
+    port: u16,
+    root_cid: []const u8,
+    blocks: []const BlockEntry,
+    cluster_secret: ?[]const u8,
+    ed25519_secret64: [64]u8,
+) !u32 {
+    // Try pooled connection first
+    if (pool.getOrDial(allocator, host, port, ed25519_secret64)) |result| {
+        const stream_id = result.conn.nextStreamId() orelse {
+            // Stream IDs exhausted — evict and fall through to fresh dial
+            pool.evictByKey(result.key);
+            return dialClusterPush(allocator, host, port, root_cid, blocks, cluster_secret, ed25519_secret64);
+        };
+        const push_result = pushOnStream(allocator, result.conn.mux, stream_id, root_cid, blocks, cluster_secret);
+        if (push_result) |count| {
+            pool.release(result.key);
+            return count;
+        } else |_| {
+            // Connection broken — evict and fall through to fresh dial
+            pool.evictByKey(result.key);
+        }
+    } else |_| {
+        // Pool dial failed — fall through to fresh dial
+    }
+
+    // Fallback: fresh non-pooled connection
+    return dialClusterPush(allocator, host, port, root_cid, blocks, cluster_secret, ed25519_secret64);
+}
+
+/// Encode BLOCK_PULL request: field 1=type, field 2=cid, field 4=cluster_secret.
+pub fn encodeBlockPull(allocator: std.mem.Allocator, cid_bytes: []const u8, cluster_secret: ?[]const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try wireproto.appendVarintField(&buf, allocator, 1, @intFromEnum(MsgType.block_pull));
+    try wireproto.appendBytesField(&buf, allocator, 2, cid_bytes);
+    if (cluster_secret) |s| {
+        try wireproto.appendBytesField(&buf, allocator, 4, s);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Encode BLOCK_PULL_RESP: field 1=type, field 2=cid, field 3=block data (or empty if not found).
+pub fn encodeBlockPullResp(allocator: std.mem.Allocator, cid_bytes: []const u8, data: ?[]const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try wireproto.appendVarintField(&buf, allocator, 1, @intFromEnum(MsgType.block_pull_resp));
+    try wireproto.appendBytesField(&buf, allocator, 2, cid_bytes);
+    if (data) |d| {
+        var entry_buf = std.ArrayList(u8).empty;
+        defer entry_buf.deinit(allocator);
+        try wireproto.appendBytesField(&entry_buf, allocator, 1, cid_bytes);
+        try wireproto.appendBytesField(&entry_buf, allocator, 2, d);
+        try wireproto.appendBytesField(&buf, allocator, 3, entry_buf.items);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Encode MANIFEST_NOTIFY: field 1=type, field 2=root_cid, field 4=cluster_secret.
+pub fn encodeManifestNotify(allocator: std.mem.Allocator, root_cid: []const u8, cluster_secret: ?[]const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try wireproto.appendVarintField(&buf, allocator, 1, @intFromEnum(MsgType.manifest_notify));
+    try wireproto.appendBytesField(&buf, allocator, 2, root_cid);
+    if (cluster_secret) |s| {
+        try wireproto.appendBytesField(&buf, allocator, 4, s);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Encode MANIFEST_ACK: field 1=type.
+pub fn encodeManifestAck(allocator: std.mem.Allocator) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try wireproto.appendVarintField(&buf, allocator, 1, @intFromEnum(MsgType.manifest_ack));
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Push blocks on an existing yamux stream (used by pooled connections).
+fn pushOnStream(
+    allocator: std.mem.Allocator,
+    mux: *libp2p_dial.YamuxOverNoise,
+    stream_id: u32,
+    root_cid: []const u8,
+    blocks: []const BlockEntry,
+    cluster_secret: ?[]const u8,
+) !u32 {
+    try mux.openClientStream(stream_id);
+
+    // Negotiate cluster push protocol on the new stream
+    try mux.streamWrite(stream_id, "/multistream/1.0.0\n");
+    const ms_resp = try mux.streamReadLine(stream_id);
+    defer allocator.free(ms_resp);
+
+    try mux.streamWrite(stream_id, proto_cluster_push);
+    const proto_resp = try mux.streamReadLine(stream_id);
+    defer allocator.free(proto_resp);
+    if (!std.mem.startsWith(u8, proto_resp, "/zipfs/cluster/push/"))
+        return error.UnexpectedMultistream;
+
+    // Encode and send push message
+    const msg = try encodePushBlocks(allocator, root_cid, blocks, cluster_secret);
+    defer allocator.free(msg);
+    try sendFramed(mux, allocator, stream_id, msg);
+
+    // Read ACK
+    const resp_pb = try mux.readLengthPrefixedProtobuf(stream_id);
+    defer allocator.free(resp_pb);
+    var decoded = try decodeMessage(allocator, resp_pb);
+    defer decoded.deinit(allocator);
+
+    if (decoded.msg_type != .push_ack) return error.UnexpectedResponse;
+    return decoded.block_count;
 }

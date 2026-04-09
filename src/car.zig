@@ -204,8 +204,10 @@ pub fn importFromSeekableFile(allocator: std.mem.Allocator, file: std.fs.File, s
     }
 }
 
-/// Export every block in `store` to a CAR v1 file (roots array empty).
-pub fn exportStoreToFile(allocator: std.mem.Allocator, store: *const Blockstore, out_path: []const u8) !void {
+/// Export every block on disk to a CAR v1 file (roots array empty).
+/// Walks the sharded blocks directory to find all blocks.
+pub fn exportStoreToFile(allocator: std.mem.Allocator, store: *Blockstore, out_path: []const u8) !void {
+    const repo_root = store.repo_root orelse return error.NoRepoRoot;
     var list: std.ArrayList(Block) = .empty;
     defer {
         for (list.items) |b| {
@@ -215,20 +217,58 @@ pub fn exportStoreToFile(allocator: std.mem.Allocator, store: *const Blockstore,
         list.deinit(allocator);
     }
 
-    const Ctx = struct {
-        list: *std.ArrayList(Block),
-        allocator: std.mem.Allocator,
-        fn collect(ctx: *anyopaque, key: []const u8, val: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            var c = try cid_mod.Cid.parse(self.allocator, key);
-            defer c.deinit(self.allocator);
-            const cb = try c.toBytes(self.allocator);
-            const data = try self.allocator.dupe(u8, val);
-            try self.list.append(self.allocator, .{ .cid_bytes = cb, .data = data });
-        }
+    // Walk the sharded blocks directory
+    const blocks_base = try std.fs.path.join(allocator, &.{ repo_root, "blocks" });
+    defer allocator.free(blocks_base);
+
+    var base_dir = std.fs.cwd().openDir(blocks_base, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            // No blocks directory — empty export
+            var file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
+            defer file.close();
+            var wbuf: [4096]u8 = undefined;
+            var fw = file.writer(&wbuf);
+            const writer = &fw.interface;
+            const root_strings: []const []const u8 = &.{};
+            try writeCarV1(allocator, writer, root_strings, list.items);
+            try writer.flush();
+            return;
+        },
+        else => |e| return e,
     };
-    var ctx = Ctx{ .list = &list, .allocator = allocator };
-    try store.each(@ptrCast(&ctx), Ctx.collect);
+    defer base_dir.close();
+
+    // Walk aa/bb/ shard subdirs
+    var it = base_dir.iterate();
+    while (try it.next()) |ent| {
+        if (ent.kind != .directory or ent.name.len != 2) continue;
+        var sub = base_dir.openDir(ent.name, .{ .iterate = true }) catch continue;
+        defer sub.close();
+        var it2 = sub.iterate();
+        while (try it2.next()) |e2| {
+            if (e2.kind != .directory or e2.name.len != 2) continue;
+            var sub2 = sub.openDir(e2.name, .{ .iterate = true }) catch continue;
+            defer sub2.close();
+            // Read block files
+            var it3 = sub2.iterate();
+            while (try it3.next()) |e3| {
+                if (e3.kind != .file) continue;
+                const cid_key = e3.name;
+                const data = sub2.readFileAlloc(allocator, cid_key, 64 << 20) catch continue;
+                errdefer allocator.free(data);
+                var c = cid_mod.Cid.parse(allocator, cid_key) catch {
+                    allocator.free(data);
+                    continue;
+                };
+                defer c.deinit(allocator);
+                const cb = c.toBytes(allocator) catch {
+                    allocator.free(data);
+                    continue;
+                };
+                try list.append(allocator, .{ .cid_bytes = cb, .data = data });
+            }
+        }
+    }
 
     var file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
     defer file.close();

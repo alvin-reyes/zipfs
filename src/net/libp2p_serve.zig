@@ -197,11 +197,8 @@ fn advanceStream(
                 }
 
                 for (want_items) |wi| {
-                    mu.lock();
-                    const raw = store.get(wi.store_key);
-                    // Dupe data while holding lock to prevent dangling pointer
-                    const data_copy = if (raw) |d| allocator.dupe(u8, d) catch null else null;
-                    mu.unlock();
+                    // No external lock — Blockstore is internally thread-safe via cache_mu
+                    const data_copy = store.get(allocator, wi.store_key);
 
                     switch (wi.want_type) {
                         .have => {
@@ -210,7 +207,7 @@ fn advanceStream(
                             const kdup = try allocator.dupe(u8, wi.store_key);
                             errdefer allocator.free(kdup);
                             try have_presence_key.put(allocator, kdup, {});
-                            const typ: bitswap.BlockPresenceType = if (raw != null) .have else .dont_have;
+                            const typ: bitswap.BlockPresenceType = if (data_copy != null) .have else .dont_have;
                             try appendPresenceForStoreKey(allocator, &pres, wi.store_key, typ);
                         },
                         .block => {
@@ -302,12 +299,10 @@ fn advanceStream(
                                 // Reject non-SHA-256 CIDs — cannot verify integrity
                                 continue;
                             }
-                            mu.lock();
+                            // No external lock — Blockstore is internally thread-safe via cache_mu
                             store.put(allocator, c, entry.data) catch {
-                                mu.unlock();
                                 continue;
                             };
-                            mu.unlock();
                             stored += 1;
                         }
                         const ack = cluster_push.encodePushAck(allocator, stored) catch return;
@@ -327,9 +322,8 @@ fn advanceStream(
                             defer c.deinit(allocator);
                             const key = c.toString(allocator) catch continue;
                             defer allocator.free(key);
-                            mu.lock();
-                            const has_block = store.get(key) != null;
-                            mu.unlock();
+                            // No external lock — Blockstore is internally thread-safe via cache_mu
+                            const has_block = store.has(key);
                             if (has_block) {
                                 have_list.append(allocator, cid_bytes) catch continue;
                             }
@@ -349,6 +343,33 @@ fn advanceStream(
                         defer framed.deinit(allocator);
                         varint.encodeU64(&framed, allocator, pong.len) catch return;
                         framed.appendSlice(allocator, pong) catch return;
+                        mux.streamWrite(stream_id, framed.items) catch return;
+                    },
+                    .block_pull => {
+                        // Serve a single block to a pulling peer
+                        if (decoded.root_cid) |cid_str| {
+                            // No external lock — Blockstore is internally thread-safe via cache_mu
+                            const block_data = store.get(allocator, cid_str);
+                            const resp = if (block_data) |data| blk_resp: {
+                                defer allocator.free(data);
+                                break :blk_resp cluster_push.encodeBlockPullResp(allocator, cid_str, data) catch return;
+                            } else cluster_push.encodeBlockPullResp(allocator, cid_str, null) catch return;
+                            defer allocator.free(resp);
+                            var framed: std.ArrayList(u8) = .empty;
+                            defer framed.deinit(allocator);
+                            varint.encodeU64(&framed, allocator, resp.len) catch return;
+                            framed.appendSlice(allocator, resp) catch return;
+                            mux.streamWrite(stream_id, framed.items) catch return;
+                        }
+                    },
+                    .manifest_notify => {
+                        // Acknowledge manifest notification
+                        const ack = cluster_push.encodeManifestAck(allocator) catch return;
+                        defer allocator.free(ack);
+                        var framed: std.ArrayList(u8) = .empty;
+                        defer framed.deinit(allocator);
+                        varint.encodeU64(&framed, allocator, ack.len) catch return;
+                        framed.appendSlice(allocator, ack) catch return;
                         mux.streamWrite(stream_id, framed.items) catch return;
                     },
                     else => {},

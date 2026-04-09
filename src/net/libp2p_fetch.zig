@@ -19,7 +19,7 @@ pub fn fetchBlockIntoStore(
     bootstrap_peers: []const []const u8,
     ed25519_secret64: [64]u8,
 ) !bool {
-    if (store.get(cid_str) != null) return false;
+    if (store.has(cid_str)) return false;
 
     var c = try cid_mod.Cid.parse(allocator, cid_str);
     defer c.deinit(allocator);

@@ -349,8 +349,11 @@ fn readFrameLen(s: std.net.Stream) !u16 {
 }
 
 fn writeFrame(s: std.net.Stream, body: []const u8) !void {
+    // Noise transport frames have a 2-byte BE length prefix: max 65535 bytes.
+    // Callers (writeTransport, handshake) must chunk plaintext to fit.
+    if (body.len > 65535) return error.NoiseFrameTooLarge;
     var hdr: [2]u8 = undefined;
-    std.mem.writeInt(u16, &hdr, @truncate(body.len), .big);
+    std.mem.writeInt(u16, &hdr, @intCast(body.len), .big);
     try s.writeAll(&hdr);
     try s.writeAll(body);
 }
@@ -483,18 +486,29 @@ pub const Session = struct {
         };
     }
 
-    /// Encrypt+send one transport frame (2-byte BE length + ciphertext).
+    /// Encrypt+send transport frames (2-byte BE length + ciphertext).
+    /// Chunks plaintext to respect the 65535-byte Noise transport frame limit.
+    /// Each chunk is encrypted independently (nonce auto-increments per call),
+    /// and the receiver accumulates chunks via YamuxOverNoise.feed.
     pub fn writeTransport(self: *Session, allocator: std.mem.Allocator, plaintext: []const u8) !void {
-        const ct = try self.enc.encrypt(plaintext, allocator);
-        defer allocator.free(ct);
-        try writeFrame(self.stream, ct);
+        const tlen = ChaCha20Poly1305.tag_length;
+        const max_plaintext: usize = 65535 - tlen; // 65519
+        var off: usize = 0;
+        while (true) {
+            const n = @min(max_plaintext, plaintext.len - off);
+            const ct = try self.enc.encrypt(plaintext[off .. off + n], allocator);
+            defer allocator.free(ct);
+            try writeFrame(self.stream, ct);
+            off += n;
+            if (off >= plaintext.len) break;
+        }
     }
 
     /// Read+decrypt one transport frame.
     pub fn readTransport(self: *Session, allocator: std.mem.Allocator) ![]u8 {
         const n = try readFrameLen(self.stream);
         const buf = try allocator.alloc(u8, n);
-        errdefer allocator.free(buf);
+        defer allocator.free(buf); // ciphertext buffer; decrypt returns a fresh plaintext buffer
         try readFull(self.stream, buf);
         return self.dec.decrypt(buf, allocator);
     }
@@ -532,4 +546,48 @@ test "noise XX local handshake" {
     defer gpa.free(ping);
     try std.testing.expectEqualStrings("ping", ping);
     try ser.writeTransport(gpa, "pong");
+}
+
+test "noise transport chunks plaintext > 64KB" {
+    const gpa = std.testing.allocator;
+    const kp = Ed25519.KeyPair.generate();
+    const sec = kp.secret_key.toBytes();
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var srv = try addr.listen(.{ .reuse_address = true });
+    defer srv.deinit();
+    const port = srv.listen_address.in.getPort();
+
+    // 200KB payload with a recognizable byte pattern
+    const payload_size: usize = 200 * 1024;
+    const payload = try gpa.alloc(u8, payload_size);
+    defer gpa.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast(i & 0xff);
+
+    const Client = struct {
+        fn run(p: u16, sk: [64]u8, pl: []const u8) void {
+            const conn = std.net.tcpConnectToHost(std.heap.page_allocator, "127.0.0.1", p) catch unreachable;
+            defer conn.close();
+            var cli = Session.handshakeInitiator(conn, std.heap.page_allocator, sk, &.{}) catch unreachable;
+            cli.writeTransport(std.heap.page_allocator, pl) catch unreachable;
+        }
+    };
+
+    var th = try std.Thread.spawn(.{}, Client.run, .{ port, sec, payload });
+    defer th.join();
+
+    const conn = try srv.accept();
+    defer conn.stream.close();
+    var ser = try Session.handshakeResponder(conn.stream, gpa, sec, &.{});
+
+    // Accumulate across multiple transport frames (receiver-side chunking reassembly).
+    var acc = std.ArrayList(u8).empty;
+    defer acc.deinit(gpa);
+    while (acc.items.len < payload_size) {
+        const chunk = try ser.readTransport(gpa);
+        defer gpa.free(chunk);
+        try acc.appendSlice(gpa, chunk);
+    }
+    try std.testing.expectEqual(payload_size, acc.items.len);
+    try std.testing.expectEqualSlices(u8, payload, acc.items);
 }
