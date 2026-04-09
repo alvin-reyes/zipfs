@@ -235,6 +235,61 @@ pub fn freeBlockEntries(allocator: std.mem.Allocator, entries: []cluster_push.Bl
     allocator.free(entries);
 }
 
+/// Push entries to a peer in batches that each fit within the yamux frame budget.
+/// The yamux frame size is capped at 4MB, so we target ≤3MB per batch (≈1MB headroom
+/// for protobuf field tags, the cluster_push envelope, and the per-frame ACK round trip).
+/// If any batch fails, the error is returned and the remaining batches are not sent.
+fn pushEntriesBatched(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    cid_str: []const u8,
+    entries: []const cluster_push.BlockEntry,
+    cluster_secret: ?[]const u8,
+    ed25519_secret64: [64]u8,
+) !void {
+    if (entries.len == 0) return;
+
+    const max_batch_bytes: usize = 3 * 1024 * 1024;
+    // Per-entry protobuf overhead: 2 field tags + 2 length varints ≈ 16 bytes worst case.
+    const per_entry_overhead: usize = 16;
+
+    var batch_start: usize = 0;
+    var batch_size: usize = 0;
+
+    var i: usize = 0;
+    while (i < entries.len) : (i += 1) {
+        const entry_size = entries[i].cid_bytes.len + entries[i].data.len + per_entry_overhead;
+
+        // Flush current batch if it has at least one entry and adding this one would overflow.
+        if (i > batch_start and batch_size + entry_size > max_batch_bytes) {
+            _ = try cluster_push.dialClusterPush(
+                allocator,
+                host,
+                port,
+                cid_str,
+                entries[batch_start..i],
+                cluster_secret,
+                ed25519_secret64,
+            );
+            batch_start = i;
+            batch_size = 0;
+        }
+        batch_size += entry_size;
+    }
+
+    // Final batch (always non-empty if we got here).
+    _ = try cluster_push.dialClusterPush(
+        allocator,
+        host,
+        port,
+        cid_str,
+        entries[batch_start..],
+        cluster_secret,
+        ed25519_secret64,
+    );
+}
+
 /// Replicate a CID's full DAG to N cluster peers.
 pub fn replicateCid(
     allocator: std.mem.Allocator,
@@ -246,11 +301,13 @@ pub fn replicateCid(
     ed25519_secret64: [64]u8,
 ) !void {
     // Collect all blocks in DAG
+    std.debug.print("[repl] collectDagBlocks for {s}\n", .{cid_str});
     const all_blocks = try collectDagBlocks(allocator, store, cid_str);
     defer {
         for (all_blocks) |b| allocator.free(b);
         allocator.free(all_blocks);
     }
+    std.debug.print("[repl] collected {d} blocks\n", .{all_blocks.len});
 
     // Ensure replica record exists
     _ = try state.upsertReplica(cid_str, .replicate, target_n);
@@ -258,6 +315,7 @@ pub fn replicateCid(
     // Get alive peers
     const alive = try state.alivePeers(allocator);
     defer allocator.free(alive);
+    std.debug.print("[repl] alive peers: {d}\n", .{alive.len});
 
     // Get current confirmed peers for this CID
     const rec = state.replicas.getPtr(cid_str) orelse return;
@@ -265,6 +323,7 @@ pub fn replicateCid(
 
     // Select new peers
     const needed: usize = if (target_n > already_confirmed.len) target_n - already_confirmed.len else 0;
+    std.debug.print("[repl] needed={d} already_confirmed={d}\n", .{ needed, already_confirmed.len });
     if (needed == 0) return;
 
     const selected = try selectPeersConsistentHash(allocator, alive, cid_str, needed, already_confirmed);
@@ -275,15 +334,18 @@ pub fn replicateCid(
     defer freeBlockEntries(allocator, entries);
 
     // Push to each selected peer and track confirmations
+    std.debug.print("[repl] pushing {d} entries to {d} peers\n", .{ entries.len, selected.len });
     var confirmed_count: usize = already_confirmed.len;
     for (selected) |peer| {
         const hp = cluster_push.parseHostPort(allocator, peer.addr) catch {
+            std.debug.print("[repl] parseHostPort failed for {s}\n", .{peer.addr});
             try state.addRetry(.push_blocks, cid_str, peer.addr, null);
             continue;
         };
         defer allocator.free(hp.host);
 
-        _ = cluster_push.dialClusterPush(
+        std.debug.print("[repl] pushing to {s}:{d}\n", .{ hp.host, hp.port });
+        pushEntriesBatched(
             allocator,
             hp.host,
             hp.port,
@@ -291,11 +353,13 @@ pub fn replicateCid(
             entries,
             cluster_secret,
             ed25519_secret64,
-        ) catch {
+        ) catch |err| {
+            std.debug.print("[repl] push FAILED to {s}:{d}: {}\n", .{ hp.host, hp.port, err });
             try state.addRetry(.push_blocks, cid_str, peer.addr, null);
             continue;
         };
 
+        std.debug.print("[repl] push OK to {s}:{d}\n", .{ hp.host, hp.port });
         try state.addConfirmedPeer(cid_str, peer.addr);
         confirmed_count += 1;
     }
@@ -344,7 +408,7 @@ pub fn shardCid(
         for (alive) |peer| {
             const hp = cluster_push.parseHostPort(allocator, peer.addr) catch continue;
             defer allocator.free(hp.host);
-            _ = cluster_push.dialClusterPush(
+            pushEntriesBatched(
                 allocator,
                 hp.host,
                 hp.port,
@@ -389,7 +453,7 @@ pub fn shardCid(
         const hp = cluster_push.parseHostPort(allocator, peer.addr) catch continue;
         defer allocator.free(hp.host);
 
-        _ = cluster_push.dialClusterPush(
+        pushEntriesBatched(
             allocator,
             hp.host,
             hp.port,
@@ -412,7 +476,7 @@ pub fn processRetryQueue(
     cluster_secret: ?[]const u8,
     ed25519_secret64: [64]u8,
 ) void {
-    const now = std.time.nanoTimestamp();
+    const now: i64 = @intCast(std.time.nanoTimestamp());
     var i: usize = 0;
     while (i < state.retry_queue.items.len) {
         var entry = &state.retry_queue.items[i];
@@ -461,7 +525,7 @@ pub fn processRetryQueue(
                 };
                 defer allocator.free(hp.host);
 
-                if (cluster_push.dialClusterPush(
+                if (pushEntriesBatched(
                     allocator,
                     hp.host,
                     hp.port,
@@ -502,7 +566,7 @@ pub fn processRetryQueue(
                 };
                 defer allocator.free(hp.host);
 
-                if (cluster_push.dialClusterPush(
+                if (pushEntriesBatched(
                     allocator,
                     hp.host,
                     hp.port,
@@ -594,7 +658,7 @@ pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
         if (alive) {
             peer.is_alive = true;
             peer.consecutive_failures = 0;
-            peer.last_seen_ns = std.time.nanoTimestamp();
+            peer.last_seen_ns = @intCast(std.time.nanoTimestamp());
         } else {
             peer.consecutive_failures +|= 1;
             if (peer.consecutive_failures >= 3) {
@@ -693,7 +757,7 @@ pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
                 .cid = cid_dup,
                 .mode = item.mode,
                 .priority = .heal,
-                .enqueued_ns = std.time.nanoTimestamp(),
+                .enqueued_ns = @intCast(std.time.nanoTimestamp()),
                 .target_peer = null,
                 .shard_index = null,
             });
@@ -739,14 +803,14 @@ pub fn selfHealOnce(allocator: std.mem.Allocator, ctx: *SelfHealCtx) !void {
 
 /// Monitor active manifests: check peer progress, mark complete, re-notify stale peers.
 fn monitorManifests(allocator: std.mem.Allocator, ctx: *SelfHealCtx) void {
-    var manifests = manifest_mod.Manifest.loadAll(allocator, ctx.repo_root) catch return;
+    const manifests = manifest_mod.Manifest.loadAll(allocator, ctx.repo_root) catch return;
     defer {
         for (manifests) |*m| m.deinit(allocator);
         allocator.free(manifests);
     }
 
-    const now = std.time.nanoTimestamp();
-    const stale_threshold_ns: i128 = 5 * 60 * std.time.ns_per_s; // 5 minutes
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const stale_threshold_ns: i64 = 5 * 60 * std.time.ns_per_s; // 5 minutes
 
     for (manifests) |*m| {
         if (m.status != .ready and m.status != .active) continue;
@@ -782,3 +846,4 @@ fn monitorManifests(allocator: std.mem.Allocator, ctx: *SelfHealCtx) void {
             };
         }
     }
+}

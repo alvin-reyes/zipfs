@@ -35,20 +35,22 @@ pub const Blockstore = struct {
 
     pub fn deinit(self: *Blockstore, allocator: std.mem.Allocator) void {
         _ = allocator;
-        self.cache_mu.lock();
-        defer self.cache_mu.unlock();
-        if (self.cache) |slots| {
-            const ca = self.cache_allocator orelse return;
-            for (slots) |slot| {
-                if (slot) |entry| {
-                    ca.free(entry.key); // shared with cache_index — frees both
-                    ca.free(entry.data);
+        {
+            self.cache_mu.lock();
+            defer self.cache_mu.unlock();
+            if (self.cache) |slots| {
+                const ca = self.cache_allocator orelse return;
+                for (slots) |slot| {
+                    if (slot) |entry| {
+                        ca.free(entry.key); // shared with cache_index — frees both
+                        ca.free(entry.data);
+                    }
                 }
+                ca.free(slots);
+                // Index keys are shared with slot keys (already freed above)
+                self.cache_index.deinit(ca);
             }
-            ca.free(slots);
-            // Index keys are shared with slot keys (already freed above)
-            self.cache_index.deinit(ca);
-        }
+        } // defer unlock runs HERE, before self.* = undefined clobbers the mutex
         self.* = undefined;
     }
 

@@ -92,6 +92,12 @@ pub const Node = struct {
     }
 };
 
+// Force test discovery in transitively-imported modules.
+test {
+    _ = net_noise;
+    _ = @import("repl_queue.zig");
+}
+
 test "cid roundtrip v1" {
     const gpa = std.testing.allocator;
     const digest = multihash.digestSha256("hello");

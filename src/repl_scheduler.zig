@@ -150,7 +150,7 @@ fn drainInbox(allocator: std.mem.Allocator, ctx: *SchedulerCtx) void {
             .cid = cid_dup,
             .mode = ctx.cluster_mode,
             .priority = .immediate,
-            .enqueued_ns = std.time.nanoTimestamp(),
+            .enqueued_ns = @intCast(std.time.nanoTimestamp()),
             .target_peer = null,
             .shard_index = null,
             .replication_factor = repl_factor,
@@ -167,7 +167,7 @@ pub fn schedulerLoop(ctx: *SchedulerCtx) void {
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
-    var last_evict_ns: i128 = std.time.nanoTimestamp();
+    var last_evict_ns: i64 = @intCast(std.time.nanoTimestamp());
 
     while (true) {
         const batch = ctx.queue.popBatch(ctx.batch_size, 5 * std.time.ns_per_s);
@@ -193,9 +193,9 @@ pub fn schedulerLoop(ctx: *SchedulerCtx) void {
 }
 
 /// Evict stale pooled connections if 60 seconds have passed since last eviction.
-fn evictStaleConnections(ctx: *SchedulerCtx, last_evict_ns: *i128) void {
-    const now = std.time.nanoTimestamp();
-    const evict_interval_ns: i128 = 60 * std.time.ns_per_s;
+fn evictStaleConnections(ctx: *SchedulerCtx, last_evict_ns: *i64) void {
+    const now: i64 = @intCast(std.time.nanoTimestamp());
+    const evict_interval_ns: i64 = 60 * std.time.ns_per_s;
     if (now - last_evict_ns.* >= evict_interval_ns) {
         if (ctx.pool) |pool| {
             pool.evictStale(evict_interval_ns);
@@ -241,11 +241,13 @@ fn processItem(allocator: std.mem.Allocator, ctx: *SchedulerCtx, item: *ReplItem
         }
 
         // Auto-select peers and replicate/shard (existing push path)
+        std.debug.print("[repl] processItem: cid={s} mode={s} factor={d}\n", .{ item.cid, @tagName(item.mode), item.replication_factor });
         switch (item.mode) {
             .replicate => {
                 const factor = if (item.replication_factor > 0) item.replication_factor else ctx.replication_factor;
                 // factor = total copies; subtract 1 for the origin node to get peer count
                 const peer_count: u8 = if (factor > 1) factor - 1 else 1;
+                std.debug.print("[repl] replicateCid: cid={s} peer_count={d}\n", .{ item.cid, peer_count });
                 replication.replicateCid(
                     allocator,
                     &state,
@@ -325,28 +327,14 @@ fn pushToPeer(
     };
     defer allocator.free(hp.host);
 
-    const push_fn = if (ctx.pool) |pool|
-        cluster_push.dialClusterPushPooled(
-            allocator,
-            pool,
-            hp.host,
-            hp.port,
-            cid_str,
-            entries,
-            ctx.cluster_secret,
-            ctx.ed25519_secret64,
-        )
-    else
-        cluster_push.dialClusterPush(
-            allocator,
-            hp.host,
-            hp.port,
-            cid_str,
-            entries,
-            ctx.cluster_secret,
-            ctx.ed25519_secret64,
-        );
-    _ = push_fn catch {
+    pushEntriesBatchedScheduler(
+        allocator,
+        ctx,
+        hp.host,
+        hp.port,
+        cid_str,
+        entries,
+    ) catch {
         // Re-enqueue as retry
         reEnqueueWithRetry(ctx, cid_str, mode, .retry_low, peer_addr, shard_index, retry_count);
         return;
@@ -357,6 +345,72 @@ fn pushToPeer(
         reEnqueueWithRetry(ctx, cid_str, mode, .retry_high, peer_addr, shard_index, retry_count);
         return;
     };
+}
+
+/// Push entries in batches under the yamux frame budget.
+/// Each batch targets ≤3MB of payload (4MB yamux cap minus protobuf/envelope headroom).
+/// Uses the connection pool when available, falling back to direct dial otherwise.
+/// Returns the first error encountered; the remaining batches are not sent.
+fn pushEntriesBatchedScheduler(
+    allocator: std.mem.Allocator,
+    ctx: *SchedulerCtx,
+    host: []const u8,
+    port: u16,
+    cid_str: []const u8,
+    entries: []const cluster_push.BlockEntry,
+) !void {
+    if (entries.len == 0) return;
+
+    const max_batch_bytes: usize = 3 * 1024 * 1024;
+    const per_entry_overhead: usize = 16;
+
+    var batch_start: usize = 0;
+    var batch_size: usize = 0;
+
+    var i: usize = 0;
+    while (i < entries.len) : (i += 1) {
+        const entry_size = entries[i].cid_bytes.len + entries[i].data.len + per_entry_overhead;
+        if (i > batch_start and batch_size + entry_size > max_batch_bytes) {
+            try dispatchBatch(allocator, ctx, host, port, cid_str, entries[batch_start..i]);
+            batch_start = i;
+            batch_size = 0;
+        }
+        batch_size += entry_size;
+    }
+
+    try dispatchBatch(allocator, ctx, host, port, cid_str, entries[batch_start..]);
+}
+
+fn dispatchBatch(
+    allocator: std.mem.Allocator,
+    ctx: *SchedulerCtx,
+    host: []const u8,
+    port: u16,
+    cid_str: []const u8,
+    batch: []const cluster_push.BlockEntry,
+) !void {
+    if (ctx.pool) |pool| {
+        _ = try cluster_push.dialClusterPushPooled(
+            allocator,
+            pool,
+            host,
+            port,
+            cid_str,
+            batch,
+            ctx.cluster_secret,
+            ctx.ed25519_secret64,
+        );
+    } else {
+        _ = try cluster_push.dialClusterPush(
+            allocator,
+            host,
+            port,
+            cid_str,
+            batch,
+            ctx.cluster_secret,
+            ctx.ed25519_secret64,
+        );
+    }
 }
 
 /// Re-enqueue a failed item with a new priority.
@@ -398,7 +452,7 @@ fn reEnqueueWithRetryAndFactor(
         .cid = cid_dup,
         .mode = mode,
         .priority = priority,
-        .enqueued_ns = std.time.nanoTimestamp(),
+        .enqueued_ns = @intCast(std.time.nanoTimestamp()),
         .target_peer = peer_dup,
         .shard_index = shard_index,
         .retry_count = retry_count + 1,
